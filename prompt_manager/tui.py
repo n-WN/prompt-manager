@@ -1,0 +1,855 @@
+"""Textual TUI for Prompt Manager - Tree-based UI."""
+
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.widgets import (
+    Header, Footer, Static, Input, Button, Label, Tree, TextArea,
+    Rule, OptionList, ContentSwitcher, Markdown
+)
+from textual.widgets.tree import TreeNode
+from textual.widgets.option_list import Option
+from textual.binding import Binding
+from textual import on
+from textual.screen import ModalScreen
+
+from datetime import datetime
+from typing import Optional
+from collections import defaultdict
+import pyperclip
+import subprocess
+import os
+
+from .db import get_connection, search_prompts, toggle_star, increment_use_count, get_stats
+from .sync import sync_all
+
+
+class ForkConfirmScreen(ModalScreen):
+    """Confirmation dialog for forking a session."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Cancel"),
+        Binding("enter", "confirm", "Confirm"),
+    ]
+
+    def __init__(self, prompt: dict):
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        source = self.prompt.get("source", "unknown")
+        project = self.prompt.get("project_path") or "N/A"
+        session_id = self.prompt.get("session_id") or "N/A"
+
+        # Determine launch command and description
+        if source == "claude_code":
+            if session_id and session_id != "N/A":
+                cmd = f"claude --resume {session_id[:12]}... --fork-session"
+                desc = "Create new session with conversation history (fork)"
+            else:
+                cmd = "claude"
+                desc = "Launch Claude Code CLI"
+        elif source == "codex":
+            cmd = "codex"
+            desc = "Launch Codex CLI (new session)"
+        elif source == "cursor":
+            cmd = "cursor ."
+            desc = "Open Cursor IDE"
+        else:
+            cmd = "N/A"
+            desc = "Unknown agent type"
+
+        with Container(id="fork-dialog"):
+            yield Label("[b]Fork Session[/]", id="fork-title")
+            yield Rule()
+            yield Static(f"[b]Source:[/] {source}")
+            yield Static(f"[b]Project:[/] {project}")
+            yield Static(f"[b]Session:[/] {session_id[:20]}..." if len(session_id) > 20 else f"[b]Session:[/] {session_id}")
+            yield Static(f"[b]Command:[/] {cmd}")
+            yield Rule()
+            yield Static(f"[cyan]{desc}[/]")
+            yield Static("\nContinue from this point with a new session?", id="fork-question")
+            with Horizontal(id="fork-actions"):
+                yield Button("Fork [Enter]", id="btn-fork-confirm", variant="primary")
+                yield Button("Cancel [Esc]", id="btn-fork-cancel", variant="default")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-fork-confirm")
+    def on_confirm(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-fork-cancel")
+    def on_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class PromptDetailScreen(ModalScreen):
+    """Modal screen to show prompt details."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+        Binding("c", "copy", "Copy"),
+        Binding("s", "star", "Star"),
+    ]
+
+    def __init__(self, prompt: dict):
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        content = self.prompt.get("content", "")
+        source = self.prompt.get("source", "unknown")
+        project = self.prompt.get("project_path", "N/A")
+        timestamp = self.prompt.get("timestamp")
+        starred = self.prompt.get("starred", False)
+        session = self.prompt.get("session_id", "N/A")
+
+        ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S") if timestamp else "N/A"
+        star_icon = "[yellow]*[/]" if starred else ""
+
+        with Container(id="detail-dialog"):
+            yield Label(f"{star_icon} Prompt Detail", id="detail-title")
+            yield Rule()
+            with Horizontal(id="detail-meta-row"):
+                yield Static(f"[b]Source:[/] {source}", classes="meta-item")
+                yield Static(f"[b]Time:[/] {ts_str}", classes="meta-item")
+            yield Static(f"[b]Project:[/] {project}", id="detail-project")
+            yield Static(f"[b]Session:[/] {session[:20]}..." if session else "", id="detail-session")
+            yield Rule()
+            with VerticalScroll(id="detail-content"):
+                yield Markdown(content)
+            with Horizontal(id="detail-actions"):
+                yield Button("Copy", id="btn-copy", variant="primary")
+                yield Button("Star" if not starred else "Unstar", id="btn-star", variant="warning")
+                yield Button("Close", id="btn-close", variant="default")
+
+    def action_copy(self) -> None:
+        try:
+            pyperclip.copy(self.prompt["content"])
+            conn = get_connection()
+            increment_use_count(conn, self.prompt["id"])
+            self.notify("Copied!", severity="information")
+        except Exception as e:
+            self.notify(f"Failed: {e}", severity="error")
+
+    def action_star(self) -> None:
+        conn = get_connection()
+        new_status = toggle_star(conn, self.prompt["id"])
+        self.prompt["starred"] = new_status
+        self.notify("Starred!" if new_status else "Unstarred")
+        self.dismiss(True)  # Signal to refresh
+
+    @on(Button.Pressed, "#btn-copy")
+    def on_copy(self) -> None:
+        self.action_copy()
+
+    @on(Button.Pressed, "#btn-star")
+    def on_star(self) -> None:
+        self.action_star()
+
+    @on(Button.Pressed, "#btn-close")
+    def on_close(self) -> None:
+        self.dismiss()
+
+
+class PromptManagerApp(App):
+    """Main TUI application for Prompt Manager."""
+
+    TITLE = "Prompt Manager"
+    SUB_TITLE = "Your AI conversation history"
+
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+
+    #app-grid {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 2fr;
+        height: 100%;
+    }
+
+    #left-panel {
+        height: 100%;
+        border-right: solid $primary-darken-2;
+        padding: 0;
+    }
+
+    #right-panel {
+        height: 100%;
+        padding: 1;
+    }
+
+    #search-container {
+        height: auto;
+        padding: 1;
+        background: $surface-darken-1;
+    }
+
+    #search-input {
+        width: 100%;
+    }
+
+    #filter-row {
+        height: 3;
+        padding: 0 1;
+        background: $surface-darken-2;
+    }
+
+    #filter-row Button {
+        min-width: 8;
+        height: 3;
+    }
+
+    .filter-active {
+        background: $primary;
+    }
+
+    #stats-bar {
+        height: 1;
+        background: $primary-darken-3;
+        color: $text-muted;
+        padding: 0 1;
+        text-style: italic;
+    }
+
+    #prompt-tree {
+        height: 1fr;
+        scrollbar-gutter: stable;
+    }
+
+    Tree {
+        padding: 0 1;
+    }
+
+    Tree > .tree--guides {
+        color: $primary-darken-2;
+    }
+
+    Tree > .tree--cursor {
+        background: $primary;
+        color: $text;
+    }
+
+    #preview-container {
+        height: 100%;
+        border: round $primary-darken-1;
+        padding: 1;
+    }
+
+    .preview-inner {
+        height: 100%;
+    }
+
+    .preview-title {
+        text-style: bold;
+        color: $primary-lighten-1;
+    }
+
+    .preview-meta {
+        color: $text-muted;
+    }
+
+    .preview-content {
+        height: 1fr;
+        background: $surface-darken-1;
+        margin: 1 0;
+        overflow-y: auto;
+    }
+
+    .preview-actions {
+        height: 3;
+        align: center middle;
+    }
+
+    .preview-actions Button {
+        margin: 0 1;
+    }
+
+    .section-label {
+        padding: 0;
+        color: $primary-lighten-1;
+    }
+
+    .response-content {
+        height: 1fr;
+        background: $surface-darken-2;
+        margin: 1 0;
+        overflow-y: auto;
+    }
+
+    Markdown {
+        padding: 0 1;
+    }
+
+    .empty-hint {
+        height: 100%;
+        content-align: center middle;
+        color: $text-muted;
+    }
+
+    /* Detail Dialog */
+    #detail-dialog {
+        width: 80%;
+        height: 85%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+
+    #detail-title {
+        text-style: bold;
+        text-align: center;
+        padding: 1;
+        color: $primary-lighten-1;
+    }
+
+    #detail-meta-row {
+        height: auto;
+    }
+
+    .meta-item {
+        width: 1fr;
+        padding: 0 1;
+    }
+
+    #detail-project, #detail-session {
+        padding: 0 1;
+        color: $text-muted;
+    }
+
+    #detail-content {
+        height: 1fr;
+        margin: 1 0;
+    }
+
+    #detail-actions {
+        height: 3;
+        align: center middle;
+    }
+
+    #detail-actions Button {
+        margin: 0 1;
+        min-width: 10;
+    }
+
+    /* Fork Dialog */
+    #fork-dialog {
+        width: 60%;
+        height: auto;
+        max-height: 50%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+
+    #fork-title {
+        text-style: bold;
+        text-align: center;
+        color: $primary-lighten-1;
+    }
+
+    #fork-question {
+        text-align: center;
+        padding: 1;
+    }
+
+    #fork-actions {
+        height: 3;
+        align: center middle;
+    }
+
+    #fork-actions Button {
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("s", "sync", "Sync"),
+        Binding("/", "focus_search", "Search"),
+        Binding("escape", "clear_filter", "Clear"),
+        Binding("c", "copy_selected", "Copy"),
+        Binding("f", "fork_session", "Fork"),
+        Binding("enter", "view_detail", "View"),
+        Binding("1", "filter_all", "All"),
+        Binding("2", "filter_claude", "Claude"),
+        Binding("3", "filter_cursor", "Cursor"),
+        Binding("4", "filter_codex", "Codex"),
+        Binding("5", "filter_starred", "Starred"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.conn = get_connection()
+        self.current_filter: Optional[str] = None
+        self.starred_only = False
+        self.search_query = ""
+        self.prompts: list[dict] = []
+        self.prompt_map: dict[str, dict] = {}  # id -> prompt
+        self.selected_prompt: Optional[dict] = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id="app-grid"):
+            with Vertical(id="left-panel"):
+                with Container(id="search-container"):
+                    yield Input(placeholder="Search...", id="search-input")
+                with Horizontal(id="filter-row"):
+                    yield Button("All", id="btn-all", variant="primary", classes="filter-active")
+                    yield Button("Claude", id="btn-claude")
+                    yield Button("Cursor", id="btn-cursor")
+                    yield Button("Codex", id="btn-codex")
+                    yield Button("*", id="btn-starred")
+                yield Static("", id="stats-bar")
+                yield Tree("Sessions", id="prompt-tree")
+            with Vertical(id="right-panel"):
+                yield Container(
+                    Static("Select a prompt to preview", classes="empty-hint"),
+                    id="preview-container"
+                )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.load_prompts()
+        self.update_stats()
+        tree = self.query_one("#prompt-tree", Tree)
+        tree.focus()
+
+    def on_unmount(self) -> None:
+        """Clean up resources when app closes."""
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
+    def load_prompts(self) -> None:
+        """Load prompts and build tree by session."""
+        self.prompts = search_prompts(
+            self.conn,
+            query=self.search_query if self.search_query else None,
+            source=self.current_filter,
+            starred_only=self.starred_only,
+            limit=1000,
+        )
+
+        # Build prompt map
+        self.prompt_map = {p["id"]: p for p in self.prompts}
+
+        # Group by source -> project -> session
+        grouped = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        for prompt in self.prompts:
+            source = prompt.get("source", "unknown")
+            project = prompt.get("project_path") or "No Project"
+            session = prompt.get("session_id") or "No Session"
+            grouped[source][project][session].append(prompt)
+
+        # Build tree
+        tree = self.query_one("#prompt-tree", Tree)
+        tree.clear()
+        tree.root.expand()
+
+        source_icons = {
+            "claude_code": "[cyan]C[/]",
+            "cursor": "[magenta]Cu[/]",
+            "codex": "[green]Cx[/]",
+            "aider": "[yellow]A[/]",
+        }
+
+        for source in sorted(grouped.keys()):
+            icon = source_icons.get(source, "[white]?[/]")
+            source_count = sum(
+                len(prompts)
+                for projects in grouped[source].values()
+                for prompts in projects.values()
+            )
+            source_node = tree.root.add(
+                f"{icon} {source} ({source_count})",
+                expand=len(grouped) == 1  # Auto-expand if single source
+            )
+
+            for project in sorted(grouped[source].keys()):
+                project_short = project.split("/")[-1] if "/" in project else project
+                project_count = sum(len(p) for p in grouped[source][project].values())
+                project_node = source_node.add(
+                    f"[blue]{project_short}[/] ({project_count})"
+                )
+
+                # Collect ALL prompts in this project for common prefix detection
+                all_project_prompts = []
+                for session_prompts in grouped[source][project].values():
+                    all_project_prompts.extend(session_prompts)
+
+                # Detect common prefix across entire project
+                project_common_prefix = self._find_common_prefix(all_project_prompts)
+
+                for session in sorted(grouped[source][project].keys(), reverse=True):
+                    prompts_in_session = grouped[source][project][session]
+                    # Sort by timestamp
+                    prompts_in_session.sort(
+                        key=lambda x: x.get("timestamp") or datetime.min,
+                        reverse=True
+                    )
+
+                    session_short = session[:12] + "..." if len(session) > 12 else session
+                    first_ts = prompts_in_session[0].get("timestamp")
+                    ts_str = first_ts.strftime("%m/%d") if first_ts else ""
+
+                    session_node = project_node.add(
+                        f"[dim]{ts_str}[/] {session_short} ({len(prompts_in_session)})"
+                    )
+
+                    for prompt in prompts_in_session:
+                        star = "[yellow]*[/]" if prompt.get("starred") else ""
+                        content = prompt.get("content", "")
+                        ts = prompt.get("timestamp")
+                        time_str = ts.strftime("%H:%M") if ts else ""
+
+                        # Generate smart label using project-level common prefix
+                        label = self._make_smart_label(content, project_common_prefix, star, time_str)
+                        session_node.add_leaf(label, data=prompt["id"])
+
+    def _find_common_prefix(self, prompts: list[dict]) -> str:
+        """Find common prefix among prompts in a project."""
+        if len(prompts) < 2:
+            return ""
+
+        contents = [p.get("content", "").replace("\n", " ") for p in prompts]
+        if not contents:
+            return ""
+
+        # Find common prefix
+        prefix = contents[0]
+        for content in contents[1:]:
+            while prefix and not content.startswith(prefix):
+                prefix = prefix[:-1]
+            if not prefix:
+                break
+
+        # Only use prefix if it's significant (>30 chars)
+        if len(prefix) < 30:
+            return ""
+
+        # Check that at least 50% of prompts have meaningful unique content
+        unique_parts = [c[len(prefix):].strip() for c in contents]
+        meaningful_count = sum(1 for u in unique_parts if len(u) >= 5)
+        if meaningful_count < len(prompts) * 0.5:
+            return ""
+
+        return prefix
+
+    def _make_smart_label(self, content: str, common_prefix: str, star: str, time_str: str) -> str:
+        """Create smart label with optional two-line display."""
+        flat = content.replace("\n", " ")
+
+        if common_prefix and flat.startswith(common_prefix):
+            # Show truncated prefix + unique part
+            prefix_display = common_prefix[:20] + "..." if len(common_prefix) > 20 else common_prefix
+            unique_part = flat[len(common_prefix):].strip()[:35]
+            if unique_part:
+                return f"{star}[dim]{time_str}[/] [dim]{prefix_display}[/]\n    → {unique_part}"
+
+        # Standard single-line preview
+        preview = flat[:40]
+        return f"{star}[dim]{time_str}[/] {preview}"
+
+    def update_stats(self) -> None:
+        stats = get_stats(self.conn)
+        stats_text = (
+            f"{stats['total']} prompts | "
+            f"C:{stats['claude_code']} Cu:{stats['cursor']} Cx:{stats['codex']} | "
+            f"*:{stats['starred']}"
+        )
+        self.query_one("#stats-bar", Static).update(stats_text)
+
+    def update_preview(self, prompt: Optional[dict]) -> None:
+        """Update the preview panel with prompt and response."""
+        self.selected_prompt = prompt
+        container = self.query_one("#preview-container", Container)
+
+        # Remove old content safely
+        for child in list(container.children):
+            child.remove()
+
+        if prompt is None:
+            container.mount(Static("Select a prompt to preview", classes="empty-hint"))
+            return
+
+        content = prompt.get("content") or ""
+        response = prompt.get("response") or ""
+        source = prompt.get("source") or "unknown"
+        timestamp = prompt.get("timestamp")
+        starred = bool(prompt.get("starred"))
+        project = prompt.get("project_path") or "N/A"
+
+        # Defensive timestamp formatting
+        ts_str = "N/A"
+        if timestamp:
+            try:
+                ts_str = timestamp.strftime("%Y-%m-%d %H:%M")
+            except (AttributeError, ValueError):
+                ts_str = str(timestamp)[:16]
+
+        star_str = "[yellow]*[/] " if starred else ""
+
+        # Build preview with optional response section
+        widgets = [
+            Static(f"{star_str}[b]{source}[/]", classes="preview-title"),
+            Static(f"{ts_str} | {project}", classes="preview-meta"),
+            Rule(),
+            Static("[b]Prompt:[/]", classes="section-label"),
+            VerticalScroll(Markdown(content), classes="preview-content"),
+        ]
+
+        if response:
+            widgets.extend([
+                Rule(),
+                Static("[b]Response:[/]", classes="section-label"),
+                VerticalScroll(Markdown(response), classes="response-content"),
+            ])
+
+        widgets.append(
+            Horizontal(
+                Button("Copy [c]", classes="btn-copy", variant="primary"),
+                Button("Star", classes="btn-star", variant="warning"),
+                Button("Fork [f]", classes="btn-fork", variant="success"),
+                Button("Full [Enter]", classes="btn-full"),
+                classes="preview-actions"
+            )
+        )
+
+        container.mount(Vertical(*widgets, classes="preview-inner"))
+
+    def action_refresh(self) -> None:
+        self.load_prompts()
+        self.update_stats()
+        self.update_preview(None)
+        self.notify("Refreshed")
+
+    def action_sync(self) -> None:
+        self.notify("Syncing...")
+        counts = sync_all(self.conn)
+        self.load_prompts()
+        self.update_stats()
+        self.notify(f"Synced {counts['total']} new prompts")
+
+    def action_focus_search(self) -> None:
+        self.query_one("#search-input", Input).focus()
+
+    def action_clear_filter(self) -> None:
+        self.search_query = ""
+        self.query_one("#search-input", Input).value = ""
+        self.current_filter = None
+        self.starred_only = False
+        self._update_filter_buttons()
+        self.load_prompts()
+
+    def action_copy_selected(self) -> None:
+        if self.selected_prompt:
+            try:
+                pyperclip.copy(self.selected_prompt["content"])
+                increment_use_count(self.conn, self.selected_prompt["id"])
+                self.notify("Copied!")
+            except Exception as e:
+                self.notify(f"Failed: {e}", severity="error")
+
+    def action_view_detail(self) -> None:
+        if self.selected_prompt:
+            self.push_screen(
+                PromptDetailScreen(self.selected_prompt),
+                callback=self._on_detail_close
+            )
+
+    def _on_detail_close(self, refresh: bool = False) -> None:
+        if refresh:
+            self.load_prompts()
+            self.update_preview(self.selected_prompt)
+
+    def _set_filter(self, source: Optional[str], starred: bool = False) -> None:
+        self.current_filter = source
+        self.starred_only = starred
+        self._update_filter_buttons()
+        self.load_prompts()
+        self.update_preview(None)
+
+    def _update_filter_buttons(self) -> None:
+        buttons = {
+            "btn-all": (None, False),
+            "btn-claude": ("claude_code", False),
+            "btn-cursor": ("cursor", False),
+            "btn-codex": ("codex", False),
+            "btn-starred": (None, True),
+        }
+
+        for btn_id, (source, starred) in buttons.items():
+            btn = self.query_one(f"#{btn_id}", Button)
+            is_active = (
+                (starred and self.starred_only) or
+                (not starred and not self.starred_only and self.current_filter == source)
+            )
+            btn.variant = "primary" if is_active else "default"
+
+    def action_filter_all(self) -> None:
+        self._set_filter(None)
+
+    def action_filter_claude(self) -> None:
+        self._set_filter("claude_code")
+
+    def action_filter_cursor(self) -> None:
+        self._set_filter("cursor")
+
+    def action_filter_codex(self) -> None:
+        self._set_filter("codex")
+
+    def action_filter_starred(self) -> None:
+        self._set_filter(None, starred=True)
+
+    @on(Input.Changed, "#search-input")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self.search_query = event.value
+        self.load_prompts()
+
+    @on(Tree.NodeSelected, "#prompt-tree")
+    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+        node = event.node
+        if node.data and node.data in self.prompt_map:
+            self.update_preview(self.prompt_map[node.data])
+        else:
+            self.update_preview(None)
+
+    @on(Button.Pressed, "#btn-all")
+    def on_all(self) -> None:
+        self.action_filter_all()
+
+    @on(Button.Pressed, "#btn-claude")
+    def on_claude(self) -> None:
+        self.action_filter_claude()
+
+    @on(Button.Pressed, "#btn-cursor")
+    def on_cursor(self) -> None:
+        self.action_filter_cursor()
+
+    @on(Button.Pressed, "#btn-codex")
+    def on_codex(self) -> None:
+        self.action_filter_codex()
+
+    @on(Button.Pressed, "#btn-starred")
+    def on_starred(self) -> None:
+        self.action_filter_starred()
+
+    @on(Button.Pressed, ".btn-copy")
+    def on_preview_copy(self) -> None:
+        self.action_copy_selected()
+
+    @on(Button.Pressed, ".btn-star")
+    def on_preview_star(self) -> None:
+        if self.selected_prompt:
+            new_status = toggle_star(self.conn, self.selected_prompt["id"])
+            self.selected_prompt["starred"] = new_status
+            self.notify("Starred!" if new_status else "Unstarred")
+            self.load_prompts()
+            self.update_preview(self.selected_prompt)
+
+    @on(Button.Pressed, ".btn-full")
+    def on_preview_full(self) -> None:
+        self.action_view_detail()
+
+    @on(Button.Pressed, ".btn-fork")
+    def on_preview_fork(self) -> None:
+        self.action_fork_session()
+
+    def action_fork_session(self) -> None:
+        """Fork from current prompt - launch agent in same project."""
+        if self.selected_prompt:
+            self.push_screen(
+                ForkConfirmScreen(self.selected_prompt),
+                callback=self._on_fork_confirm
+            )
+
+    def _on_fork_confirm(self, confirmed: bool) -> None:
+        """Handle fork confirmation."""
+        if not confirmed or not self.selected_prompt:
+            return
+
+        source = self.selected_prompt.get("source", "")
+        project = self.selected_prompt.get("project_path") or ""
+        session_id = self.selected_prompt.get("session_id") or ""
+
+        # Determine working directory and command
+        if source == "claude_code":
+            # Claude Code: use --resume with --fork-session
+            work_dir = project if project.startswith("/") else os.path.expanduser("~")
+            if session_id:
+                cmd = ["claude", "--resume", session_id, "--fork-session"]
+            else:
+                cmd = ["claude"]
+        elif source == "codex":
+            # Codex: simple launch (no fork support known)
+            work_dir = os.path.expanduser("~")
+            cmd = ["codex"]
+        elif source == "cursor":
+            # Cursor: open in project directory
+            work_dir = os.path.expanduser("~")
+            cmd = ["cursor", "."]
+        else:
+            self.notify(f"Unknown source: {source}", severity="error")
+            return
+
+        # Verify directory exists
+        if not os.path.isdir(work_dir):
+            work_dir = os.path.expanduser("~")
+
+        try:
+            # Launch in new terminal
+            self._launch_in_terminal(cmd, work_dir)
+            if source == "claude_code" and session_id:
+                self.notify(f"Forking session {session_id[:8]}... in {work_dir}")
+            else:
+                self.notify(f"Launching {source} in {work_dir}")
+        except Exception as e:
+            self.notify(f"Launch failed: {e}", severity="error")
+
+    def _launch_in_terminal(self, cmd: list, work_dir: str) -> None:
+        """Launch command in a new terminal window."""
+        import platform
+
+        if platform.system() == "Darwin":
+            # macOS - use osascript to open Terminal
+            script = f'''
+            tell application "Terminal"
+                activate
+                do script "cd '{work_dir}' && {' '.join(cmd)}"
+            end tell
+            '''
+            subprocess.Popen(["osascript", "-e", script])
+        elif platform.system() == "Linux":
+            # Linux - try common terminals
+            terminals = [
+                ["gnome-terminal", "--", "bash", "-c", f"cd '{work_dir}' && {' '.join(cmd)}; exec bash"],
+                ["xterm", "-e", f"cd '{work_dir}' && {' '.join(cmd)}; bash"],
+                ["konsole", "-e", f"cd '{work_dir}' && {' '.join(cmd)}"],
+            ]
+            for term_cmd in terminals:
+                try:
+                    subprocess.Popen(term_cmd)
+                    return
+                except FileNotFoundError:
+                    continue
+            raise RuntimeError("No supported terminal found")
+        else:
+            # Windows or other
+            subprocess.Popen(cmd, cwd=work_dir, shell=True)
+
+
+def main():
+    """Run the TUI application."""
+    app = PromptManagerApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
