@@ -18,7 +18,7 @@ A TUI tool to manage and search prompts from various AI coding assistants.
 - Fork sessions to continue conversations
 - Incremental sync (only processes changed files)
 
-## Installation
+## Development
 
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
@@ -28,7 +28,7 @@ cd prompt-manager
 uv sync
 ```
 
-## Usage
+### Launch or run directly
 
 ```bash
 # Launch TUI
@@ -36,6 +36,26 @@ uv run pm
 
 # Or run directly
 uv run python -m prompt_manager.tui
+```
+
+
+## Usage
+
+### By uvx
+
+```bash
+uvx git+https://github.com/n-WN/prompt-manager.git
+```
+
+### By uv
+
+```bash
+uv tool install git+https://github.com/n-WN/prompt-manager.git
+
+pm 
+
+#or
+prompt-manager
 ```
 
 ## Keyboard Shortcuts
