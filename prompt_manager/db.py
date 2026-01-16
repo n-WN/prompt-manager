@@ -21,7 +21,7 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS prompts (
             id VARCHAR PRIMARY KEY,
-            source VARCHAR NOT NULL,           -- 'claude_code', 'cursor', 'aider'
+            source VARCHAR NOT NULL,           -- 'claude_code', 'cursor', 'aider', 'codex', 'gemini_cli'
             project_path VARCHAR,              -- Original project path
             session_id VARCHAR,                -- Session/conversation ID
             content TEXT NOT NULL,             -- The actual prompt text
@@ -50,11 +50,14 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
-    # Full-text search index
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_prompts_content
-        ON prompts(content)
-    """)
+    # Avoid indexing raw prompt content:
+    # DuckDB ART indexes have a maximum key size (~120KB). Real-world agent logs
+    # can easily exceed this (e.g. large diffs / tool outputs), causing commits to
+    # fail. Drop legacy index if present.
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_prompts_content")
+    except Exception:
+        pass
 
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_prompts_source
@@ -77,16 +80,38 @@ def insert_prompt(
     timestamp: Optional[datetime] = None,
     response: Optional[str] = None,
 ) -> bool:
-    """Insert a prompt if it doesn't exist. Returns True if inserted."""
-    try:
-        conn.execute("""
-            INSERT INTO prompts (id, source, project_path, session_id, content, timestamp, response)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (id) DO UPDATE SET response = COALESCE(EXCLUDED.response, prompts.response)
-        """, [id, source, project_path, session_id, content, timestamp, response])
+    """Insert a prompt if it doesn't exist.
+
+    Returns:
+        True if a new row was inserted, False if it already existed.
+    """
+    inserted = conn.execute(
+        """
+        INSERT INTO prompts (id, source, project_path, session_id, content, timestamp, response)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO NOTHING
+        RETURNING id
+        """,
+        [id, source, project_path, session_id, content, timestamp, response],
+    ).fetchone()
+
+    if inserted:
         return True
-    except Exception:
-        return False
+
+    # Existing prompt: opportunistically fill in missing response without
+    # counting it as a "new prompt" for sync stats.
+    if response:
+        conn.execute(
+            """
+            UPDATE prompts
+            SET response = COALESCE(response, ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            [response, id],
+        )
+
+    return False
 
 
 def search_prompts(
@@ -157,6 +182,7 @@ def get_stats(conn: duckdb.DuckDBPyConnection) -> dict:
             COUNT(CASE WHEN source = 'cursor' THEN 1 END) as cursor,
             COUNT(CASE WHEN source = 'aider' THEN 1 END) as aider,
             COUNT(CASE WHEN source = 'codex' THEN 1 END) as codex,
+            COUNT(CASE WHEN source = 'gemini_cli' THEN 1 END) as gemini_cli,
             COUNT(CASE WHEN starred THEN 1 END) as starred,
             SUM(use_count) as total_uses
         FROM prompts
@@ -168,8 +194,9 @@ def get_stats(conn: duckdb.DuckDBPyConnection) -> dict:
         'cursor': result[2],
         'aider': result[3],
         'codex': result[4],
-        'starred': result[5],
-        'total_uses': result[6] or 0,
+        'gemini_cli': result[5],
+        'starred': result[6],
+        'total_uses': result[7] or 0,
     }
 
 

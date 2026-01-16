@@ -18,7 +18,7 @@ def main():
     sync_parser = subparsers.add_parser("sync", help="Sync prompts from all sources")
     sync_parser.add_argument(
         "--source",
-        choices=["claude_code", "cursor", "aider", "codex"],
+        choices=["claude_code", "cursor", "aider", "codex", "gemini_cli"],
         help="Only sync from specific source"
     )
 
@@ -27,7 +27,7 @@ def main():
     search_parser.add_argument("query", nargs="?", help="Search query")
     search_parser.add_argument(
         "--source",
-        choices=["claude_code", "cursor", "aider", "codex"],
+        choices=["claude_code", "cursor", "aider", "codex", "gemini_cli"],
         help="Filter by source"
     )
     search_parser.add_argument(
@@ -67,6 +67,7 @@ def main():
             print(f"  Cursor: {counts['cursor']}")
             print(f"  Aider: {counts['aider']}")
             print(f"  Codex: {counts['codex']}")
+            print(f"  Gemini CLI: {counts['gemini_cli']}")
 
     elif args.command == "search":
         from .db import get_connection, search_prompts
@@ -106,6 +107,7 @@ def main():
         print(f"  Cursor:         {stats['cursor']}")
         print(f"  Aider:          {stats['aider']}")
         print(f"  Codex:          {stats['codex']}")
+        print(f"  Gemini CLI:     {stats['gemini_cli']}")
         print(f"Starred:          {stats['starred']}")
         print(f"Total uses:       {stats['total_uses']}")
 

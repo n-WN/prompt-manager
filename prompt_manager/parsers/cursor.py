@@ -1,10 +1,13 @@
 """Parser for Cursor chat logs."""
 
+import base64
 import sqlite3
 import binascii
 import json
+import os
 from pathlib import Path
-from typing import Iterator, Optional, List, Tuple, Set
+from typing import Iterator, Optional, List, Tuple, Set, Any, Dict
+from collections import Counter, defaultdict
 
 from . import BaseParser, ParsedPrompt
 
@@ -12,10 +15,21 @@ from . import BaseParser, ParsedPrompt
 class CursorParser(BaseParser):
     """Parser for Cursor SQLite chat logs.
 
-    Log location: ~/.cursor/chats/<workspace-id>/<chat-id>/store.db
-    Format: SQLite with tables:
+    Supported locations:
+        - Legacy: ~/.cursor/chats/<workspace-id>/<chat-id>/store.db
+        - Modern (VS Code globalStorage):
+            - macOS: ~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
+            - Linux: ~/.config/Cursor/User/globalStorage/state.vscdb
+
+    Legacy format: SQLite with tables:
         - blobs: id (TEXT), data (BLOB) - conversation data (JSON or Protobuf)
         - meta: key (TEXT), value (TEXT) - hex-encoded JSON metadata
+
+    globalStorage format: SQLite with tables:
+        - cursorDiskKV: key (TEXT), value (BLOB/TEXT) - JSON (sometimes base64 JSON)
+          Keys of interest:
+            - composerData:<composerId>
+            - bubbleId:<composerId>:<bubbleId>
     """
 
     source_name = "cursor"
@@ -25,21 +39,50 @@ class CursorParser(BaseParser):
 
     def find_log_files(self) -> Iterator[Path]:
         """Find all Cursor SQLite database files."""
-        if not self.base_path.exists():
-            return
+        yielded: Set[Path] = set()
 
-        for workspace_dir in self.base_path.iterdir():
-            if not workspace_dir.is_dir():
-                continue
-            for chat_dir in workspace_dir.iterdir():
-                if not chat_dir.is_dir():
+        # Legacy store.db locations
+        if self.base_path.exists():
+            for workspace_dir in self.base_path.iterdir():
+                if not workspace_dir.is_dir():
                     continue
-                db_file = chat_dir / "store.db"
-                if db_file.exists():
-                    yield db_file
+                for chat_dir in workspace_dir.iterdir():
+                    if not chat_dir.is_dir():
+                        continue
+                    db_file = chat_dir / "store.db"
+                    if db_file.exists() and db_file not in yielded:
+                        yielded.add(db_file)
+                        yield db_file
+
+        # Modern globalStorage DB (Cursor is VS Code-based)
+        for candidate in self._candidate_state_vscdb_paths():
+            if candidate.exists() and candidate not in yielded:
+                yielded.add(candidate)
+                yield candidate
+
+    def _candidate_state_vscdb_paths(self) -> list[Path]:
+        candidates: list[Path] = []
+        home = Path.home()
+        # macOS
+        candidates.append(home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb")
+        # Linux (common)
+        candidates.append(home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb")
+        # Windows (Roaming)
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "Cursor" / "User" / "globalStorage" / "state.vscdb")
+        return candidates
 
     def parse_file(self, file_path: Path) -> Iterator[ParsedPrompt]:
         """Parse a Cursor SQLite database."""
+        if file_path.name == "state.vscdb":
+            yield from self._parse_state_vscdb(file_path)
+            return
+
+        yield from self._parse_legacy_store_db(file_path)
+
+    def _parse_legacy_store_db(self, file_path: Path) -> Iterator[ParsedPrompt]:
+        """Parse legacy Cursor chat DB at ~/.cursor/chats/**/store.db."""
         workspace_id = file_path.parent.parent.name
         chat_id = file_path.parent.name
 
@@ -153,6 +196,272 @@ class CursorParser(BaseParser):
 
         finally:
             conn.close()
+
+    def _parse_state_vscdb(self, file_path: Path) -> Iterator[ParsedPrompt]:
+        """Parse Cursor globalStorage DB (state.vscdb)."""
+        try:
+            conn = sqlite3.connect(f"file:{file_path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return
+
+        try:
+            # Ensure expected table exists
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "cursorDiskKV" not in tables:
+                return
+
+            composers: Dict[str, Dict[str, Any]] = {}
+            for key, value in conn.execute(
+                "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+            ):
+                composer_id = self._parse_composer_id(key)
+                if not composer_id:
+                    continue
+                obj = self._decode_kv_json(value)
+                if isinstance(obj, dict):
+                    composers[composer_id] = obj
+
+            bubbles_by_composer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for key, value in conn.execute(
+                "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
+            ):
+                composer_id, bubble_id = self._parse_bubble_key(key)
+                if not composer_id or not bubble_id:
+                    continue
+
+                obj = self._decode_kv_json(value)
+                if not isinstance(obj, dict):
+                    continue
+
+                # Normalize bubble id
+                if not obj.get("bubbleId"):
+                    obj["bubbleId"] = bubble_id
+                obj["_composerId"] = composer_id
+
+                bubbles_by_composer[composer_id].append(obj)
+
+            for composer_id, bubbles in bubbles_by_composer.items():
+                composer = composers.get(composer_id, {})
+
+                project_path = self._infer_project_path(composer)
+                if project_path:
+                    project_label = f"cursor:{project_path}"
+                else:
+                    project_label = "cursor"
+
+                # Sort bubbles by a stable numeric time key
+                prepared: list[tuple[float, dict[str, Any]]] = []
+                for bubble in bubbles:
+                    sort_key = self._bubble_sort_key(bubble)
+                    prepared.append((sort_key, bubble))
+                prepared.sort(key=lambda x: (x[0], str(x[1].get("bubbleId", ""))))
+
+                # Create prompts by pairing user bubbles (type=1) with subsequent assistant bubbles (type=2)
+                idx = 0
+                while idx < len(prepared):
+                    _, bubble = prepared[idx]
+                    if bubble.get("type") != 1:
+                        idx += 1
+                        continue
+
+                    content = bubble.get("text") or ""
+                    if not isinstance(content, str):
+                        idx += 1
+                        continue
+
+                    content = self._clean_user_content(content)
+                    if len(content.strip()) < 10:
+                        idx += 1
+                        continue
+
+                    timestamp = self._bubble_timestamp(bubble) or self.parse_timestamp(
+                        composer.get("createdAt")
+                    )
+
+                    response_parts: list[str] = []
+                    j = idx + 1
+                    while j < len(prepared):
+                        _, next_bubble = prepared[j]
+                        if next_bubble.get("type") == 1:
+                            break
+                        if next_bubble.get("type") == 2:
+                            text = next_bubble.get("text") or ""
+                            if isinstance(text, str) and text.strip():
+                                response_parts.append(text)
+                        j += 1
+
+                    response = "\n".join(response_parts) if response_parts else None
+
+                    bubble_id = str(bubble.get("bubbleId") or "")
+                    prompt_id = self.generate_id(
+                        self.source_name,
+                        content,
+                        composer_id,
+                        bubble_id,
+                    )
+
+                    yield ParsedPrompt(
+                        id=prompt_id,
+                        source=self.source_name,
+                        content=content,
+                        project_path=project_label,
+                        session_id=composer_id,
+                        timestamp=timestamp,
+                        response=response,
+                    )
+
+                    idx += 1
+
+        finally:
+            conn.close()
+
+    def _parse_composer_id(self, key: str) -> Optional[str]:
+        if not isinstance(key, str):
+            return None
+        if not key.startswith("composerData:"):
+            return None
+        return key.split(":", 1)[1] or None
+
+    def _parse_bubble_key(self, key: str) -> tuple[Optional[str], Optional[str]]:
+        if not isinstance(key, str) or not key.startswith("bubbleId:"):
+            return None, None
+        parts = key.split(":", 2)
+        if len(parts) != 3:
+            return None, None
+        composer_id = parts[1] or None
+        bubble_id = parts[2] or None
+        return composer_id, bubble_id
+
+    def _decode_kv_json(self, value: Any) -> Optional[Any]:
+        """Decode a cursorDiskKV/ItemTable value into JSON when possible."""
+        if value is None:
+            return None
+
+        if isinstance(value, memoryview):
+            raw = value.tobytes()
+        elif isinstance(value, (bytes, bytearray)):
+            raw = bytes(value)
+        elif isinstance(value, str):
+            raw = value.encode("utf-8", errors="ignore")
+        else:
+            try:
+                raw = bytes(value)
+            except Exception:
+                return None
+
+        # Fast path: UTF-8 JSON
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+
+        if text is not None:
+            stripped = text.lstrip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+            # base64 JSON stored as text
+            try:
+                decoded = base64.b64decode(text, validate=True)
+                try:
+                    return json.loads(decoded.decode("utf-8"))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # base64 JSON stored as bytes
+        try:
+            decoded = base64.b64decode(raw, validate=True)
+            try:
+                return json.loads(decoded.decode("utf-8"))
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _bubble_timestamp(self, bubble: dict[str, Any]):
+        created_at = bubble.get("createdAt")
+        if created_at:
+            return self.parse_timestamp(created_at)
+        timing = bubble.get("timingInfo")
+        if isinstance(timing, dict):
+            end_time = timing.get("clientEndTime")
+            if end_time:
+                return self.parse_timestamp(end_time)
+        return None
+
+    def _bubble_sort_key(self, bubble: dict[str, Any]) -> float:
+        ts = self._bubble_timestamp(bubble)
+        if ts is None:
+            # Put unknown timestamps last; still deterministic with bubbleId tie-breaker.
+            return float("inf")
+        try:
+            return ts.timestamp()
+        except Exception:
+            return float("inf")
+
+    def _infer_project_path(self, composer: dict[str, Any]) -> Optional[str]:
+        """Try to infer a stable project/root path from composerData."""
+        if not isinstance(composer, dict) or not composer:
+            return None
+
+        paths: list[str] = []
+
+        # codeBlockData contains lots of URI metadata; fsPath is the most useful.
+        code_block_data = composer.get("codeBlockData")
+        if isinstance(code_block_data, dict):
+            for entry in code_block_data.values():
+                if not isinstance(entry, dict):
+                    continue
+                uri = entry.get("uri")
+                if isinstance(uri, dict):
+                    fs_path = uri.get("fsPath")
+                    if isinstance(fs_path, str) and fs_path:
+                        paths.append(fs_path)
+
+        # Some versions store a plain list of URIs.
+        uris = composer.get("allAttachedFileCodeChunksUris")
+        if isinstance(uris, list):
+            for u in uris:
+                if isinstance(u, str) and u.startswith("file://"):
+                    paths.append(u.replace("file://", ""))
+
+        if not paths:
+            return None
+
+        # Prefer a Git root if available.
+        roots = Counter()
+        for p in paths:
+            try:
+                path_obj = Path(p)
+            except Exception:
+                continue
+            for parent in [path_obj] + list(path_obj.parents):
+                if (parent / ".git").exists():
+                    roots[str(parent)] += 1
+                    break
+
+        if roots:
+            return roots.most_common(1)[0][0]
+
+        # Fall back to common path prefix.
+        try:
+            import os as _os
+            common = _os.path.commonpath(paths)
+            if common and common != "/":
+                return common
+        except Exception:
+            return None
+
+        return None
 
     def _clean_user_content(self, content: str) -> str:
         """Clean up user content by removing XML tags."""

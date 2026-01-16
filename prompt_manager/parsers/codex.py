@@ -1,20 +1,27 @@
 """Parser for Codex CLI (OpenAI Codex) logs."""
 
 import json
+import re
 from pathlib import Path
-from typing import Iterator, Optional, List, Tuple
+from typing import Iterator, Optional
 
 from . import BaseParser, ParsedPrompt
 
+_UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
+
 
 class CodexParser(BaseParser):
-    """Parser for Codex CLI session logs.
+    """Parser for Codex session rollouts.
 
-    Log location: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
-    Format: JSONL with types:
-        - session_meta: {id, cwd, model, ...}
-        - event_msg with user_message: user prompts
-        - response_item with role=assistant: assistant responses
+    Current Codex CLI format:
+      - JSONL under `~/.codex/sessions/**/rollout-*.jsonl`
+      - Each line is a JSON object with `timestamp`, `type`, and `payload`
+
+    Legacy format (older Codex builds):
+      - Single JSON document `~/.codex/sessions/rollout-*.json`
+      - Top-level `{session, items}` where `items` includes message/function call objects
     """
 
     source_name = "codex"
@@ -25,94 +32,189 @@ class CodexParser(BaseParser):
     def find_log_files(self) -> Iterator[Path]:
         """Find Codex session files."""
         sessions_dir = self.base_path / "sessions"
-        if sessions_dir.exists():
-            for rollout_file in sessions_dir.rglob("rollout-*.jsonl"):
-                yield rollout_file
+        if not sessions_dir.exists():
+            return
+        yield from sessions_dir.rglob("rollout-*.jsonl")
+        yield from sessions_dir.rglob("rollout-*.json")
 
     def parse_file(self, file_path: Path) -> Iterator[ParsedPrompt]:
-        """Parse Codex session rollout file."""
-        # Read all lines
-        lines = []
+        """Parse a Codex rollout file."""
+        if file_path.suffix == ".json":
+            yield from self._parse_json_rollout(file_path)
+            return
+        yield from self._parse_jsonl_rollout(file_path)
+
+    def _parse_jsonl_rollout(self, file_path: Path) -> Iterator[ParsedPrompt]:
+        """Parse Codex JSONL rollout file."""
+        has_user_events = self._jsonl_has_user_events(file_path)
+
+        session_id: Optional[str] = None
+        project_path: Optional[str] = None
+
+        pending_content: Optional[str] = None
+        pending_ts: Optional[str] = None
+        pending_response: Optional[str] = None
+
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    lines.append(json.loads(line))
-                except json.JSONDecodeError:
+                obj = self._load_json_line(line)
+                if obj is None:
                     continue
 
-        # Extract session metadata
-        session_id = None
-        project_path = None
-        for data in lines:
-            if data.get("type") == "session_meta":
-                payload = data.get("payload", {})
-                session_id = payload.get("id", "")
-                project_path = payload.get("cwd")
-                break
+                item_type = obj.get("type")
+                payload = obj.get("payload")
 
-        if not session_id:
-            # Fallback: extract from filename
-            session_id = file_path.stem.split("-", 1)[-1] if "-" in file_path.stem else file_path.stem
+                if session_id is None and item_type == "session_meta" and isinstance(payload, dict):
+                    session_id = payload.get("id") or None
+                    project_path = payload.get("cwd") or project_path
+                    continue
 
-        # Collect user messages and assistant responses
-        messages: List[Tuple[str, str, Optional[str]]] = []  # (content, timestamp, response)
+                if project_path is None and item_type == "turn_context" and isinstance(payload, dict):
+                    project_path = payload.get("cwd") or project_path
 
-        i = 0
-        while i < len(lines):
-            data = lines[i]
+                if has_user_events:
+                    is_user_marker = (
+                        item_type == "event_msg"
+                        and isinstance(payload, dict)
+                        and payload.get("type") == "user_message"
+                    )
+                    user_message = payload.get("message") if isinstance(payload, dict) else None
+                else:
+                    is_user_marker = (
+                        item_type == "response_item"
+                        and isinstance(payload, dict)
+                        and payload.get("type") == "message"
+                        and payload.get("role") == "user"
+                    )
+                    user_message = (
+                        self._extract_text_blocks(payload.get("content"), {"input_text", "text"})
+                        if isinstance(payload, dict)
+                        else None
+                    )
 
-            # Find user message
-            user_content = None
-            user_ts = None
+                if is_user_marker:
+                    if pending_content and len(pending_content.strip()) >= 10:
+                        timestamp = self.parse_timestamp(pending_ts)
+                        prompt_id = self.generate_id(
+                            self.source_name,
+                            pending_content,
+                            session_id or self._extract_session_id_from_path(file_path),
+                            pending_ts or "",
+                        )
+                        yield ParsedPrompt(
+                            id=prompt_id,
+                            source=self.source_name,
+                            content=pending_content,
+                            project_path=project_path,
+                            session_id=session_id,
+                            timestamp=timestamp,
+                            response=pending_response,
+                        )
 
-            if data.get("type") == "event_msg":
-                payload = data.get("payload", {})
-                if payload.get("type") == "user_message":
-                    user_content = payload.get("message", "")
-                    user_ts = data.get("timestamp")
+                    pending_content = str(user_message or "")
+                    pending_ts = obj.get("timestamp")
+                    pending_response = None
+                    continue
 
-            if not user_content or len(user_content.strip()) < 10:
-                i += 1
+                if pending_content is None:
+                    continue
+
+                # Prefer structured assistant response items; fall back to event msg if needed.
+                if item_type == "response_item" and isinstance(payload, dict):
+                    if payload.get("type") == "message" and payload.get("role") == "assistant":
+                        text = self._extract_text_blocks(payload.get("content"), {"output_text", "text"})
+                        if text:
+                            pending_response = pending_response or text
+                elif item_type == "event_msg" and isinstance(payload, dict):
+                    if payload.get("type") == "agent_message":
+                        text = payload.get("message")
+                        if isinstance(text, str) and text.strip():
+                            pending_response = pending_response or text
+
+        if pending_content and len(pending_content.strip()) >= 10:
+            timestamp = self.parse_timestamp(pending_ts)
+            prompt_id = self.generate_id(
+                self.source_name,
+                pending_content,
+                session_id or self._extract_session_id_from_path(file_path),
+                pending_ts or "",
+            )
+            yield ParsedPrompt(
+                id=prompt_id,
+                source=self.source_name,
+                content=pending_content,
+                project_path=project_path,
+                session_id=session_id,
+                timestamp=timestamp,
+                response=pending_response,
+            )
+
+    def _jsonl_has_user_events(self, file_path: Path) -> bool:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    obj = self._load_json_line(line)
+                    if obj is None:
+                        continue
+                    if obj.get("type") != "event_msg":
+                        continue
+                    payload = obj.get("payload")
+                    if isinstance(payload, dict) and payload.get("type") == "user_message":
+                        return True
+        except OSError:
+            return False
+        return False
+
+    def _parse_json_rollout(self, file_path: Path) -> Iterator[ParsedPrompt]:
+        """Parse legacy Codex rollouts stored as a single JSON document."""
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        session = data.get("session") or {}
+        items = data.get("items") or []
+        if not isinstance(session, dict) or not isinstance(items, list):
+            return
+
+        session_id = session.get("id") or self._extract_session_id_from_path(file_path)
+        project_path = session.get("cwd")
+        session_ts = session.get("timestamp")
+        session_dt = self.parse_timestamp(session_ts)
+
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "message" or item.get("role") != "user":
                 continue
 
-            # Look ahead for assistant response
-            response = None
-            j = i + 1
-            while j < len(lines):
-                next_data = lines[j]
+            user_content = self._extract_text_blocks(item.get("content"), {"input_text", "text"})
+            if not user_content or len(user_content.strip()) < 10:
+                continue
 
-                # Stop at next user message
-                if next_data.get("type") == "event_msg":
-                    next_payload = next_data.get("payload", {})
-                    if next_payload.get("type") == "user_message":
+            response: Optional[str] = None
+            for next_item in items[idx + 1 :]:
+                if not isinstance(next_item, dict):
+                    continue
+                if next_item.get("type") == "message" and next_item.get("role") == "user":
+                    break
+                if next_item.get("type") == "message" and next_item.get("role") == "assistant":
+                    response = self._extract_text_blocks(
+                        next_item.get("content"), {"output_text", "text"}
+                    )
+                    if response:
                         break
 
-                # Extract assistant response
-                if next_data.get("type") == "response_item":
-                    next_payload = next_data.get("payload", {})
-                    if next_payload.get("role") == "assistant":
-                        content_list = next_payload.get("content", [])
-                        for item in content_list:
-                            if isinstance(item, dict) and item.get("type") == "output_text":
-                                text = item.get("text", "")
-                                if text:
-                                    response = text
-                                    break
-                        if response:
-                            break
-                j += 1
-
-            # Parse timestamp
-            timestamp = self.parse_timestamp(user_ts)
-
+            # This format lacks per-item timestamps; include the index to keep IDs stable/unique.
+            unique_ts_key = f"{session_ts or ''}:{idx}"
             prompt_id = self.generate_id(
                 self.source_name,
                 user_content,
                 session_id,
-                user_ts or ""
+                unique_ts_key,
             )
 
             yield ParsedPrompt(
@@ -121,8 +223,35 @@ class CodexParser(BaseParser):
                 content=user_content,
                 project_path=project_path,
                 session_id=session_id,
-                timestamp=timestamp,
+                timestamp=session_dt,
                 response=response,
             )
 
-            i += 1
+    def _extract_text_blocks(self, content, block_types: set[str]) -> Optional[str]:
+        if not isinstance(content, list):
+            return None
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") not in block_types:
+                continue
+            text = block.get("text", "")
+            if isinstance(text, str) and text:
+                parts.append(text)
+        joined = "\n".join(parts).strip()
+        return joined or None
+
+    def _extract_session_id_from_path(self, file_path: Path) -> str:
+        m = _UUID_RE.search(file_path.stem)
+        return m.group(1) if m else file_path.stem
+
+    def _load_json_line(self, line: str) -> Optional[dict]:
+        line = line.strip()
+        if not line:
+            return None
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        return obj if isinstance(obj, dict) else None

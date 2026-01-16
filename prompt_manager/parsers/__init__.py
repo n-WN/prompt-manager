@@ -90,6 +90,7 @@ class BaseParser(ABC):
             default_formats = formats or [
                 "%Y-%m-%d %H:%M:%S",
                 "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H-%M-%S",
                 "%Y-%m-%d",
             ]
             for fmt in default_formats:
