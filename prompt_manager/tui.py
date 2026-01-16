@@ -43,7 +43,7 @@ class ForkConfirmScreen(ModalScreen):
         # Determine launch command and description
         if source == "claude_code":
             if session_id and session_id != "N/A":
-                cmd = f"claude --resume {session_id[:12]}... --fork-session"
+                cmd = f"claude --resume {session_id} --fork-session"
                 desc = "Create new session with conversation history (fork)"
             else:
                 cmd = "claude"
@@ -51,9 +51,15 @@ class ForkConfirmScreen(ModalScreen):
         elif source == "codex":
             cmd = "codex"
             desc = "Launch Codex CLI (new session)"
+        elif source == "aider":
+            cmd = "aider"
+            desc = "Launch Aider (new chat in project directory)"
         elif source == "cursor":
             cmd = "cursor ."
             desc = "Open Cursor IDE"
+        elif source == "gemini_cli":
+            cmd = "gemini"
+            desc = "Launch Gemini CLI (new session)"
         else:
             cmd = "N/A"
             desc = "Unknown agent type"
@@ -82,6 +88,77 @@ class ForkConfirmScreen(ModalScreen):
     @on(Button.Pressed, "#btn-fork-cancel")
     def on_cancel(self) -> None:
         self.dismiss(False)
+
+
+class CommandPaletteScreen(ModalScreen):
+    """Command palette similar to OpenCode's command list."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+    ]
+
+    def __init__(self, commands: list[tuple[str, str]]):
+        super().__init__()
+        self.commands = commands
+
+    def compose(self) -> ComposeResult:
+        with Container(id="command-dialog"):
+            yield Label("[b]Commands[/]", id="command-title")
+            yield Rule()
+            yield Input(placeholder="Filter...", id="command-filter")
+            yield OptionList(id="command-list")
+
+    def on_mount(self) -> None:
+        self._set_options("")
+        self.query_one("#command-filter", Input).focus()
+
+    def _set_options(self, query: str) -> None:
+        q = query.strip().lower()
+        options = []
+        for command_id, description in self.commands:
+            if q and q not in command_id.lower() and q not in description.lower():
+                continue
+            options.append(Option(f"{command_id} — {description}", id=command_id))
+        self.query_one("#command-list", OptionList).set_options(options)
+
+    @on(Input.Changed, "#command-filter")
+    def on_filter_changed(self, event: Input.Changed) -> None:
+        self._set_options(event.value)
+
+    @on(OptionList.OptionSelected, "#command-list")
+    def on_command_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_id:
+            self.dismiss(event.option_id)
+
+
+class HelpScreen(ModalScreen):
+    """Simple help screen for keybinds and actions."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+        Binding("q", "dismiss", "Close"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        help_md = """\
+## Prompt Manager
+
+- `/` Focus search
+- `ctrl+p` Command palette
+- `1-5` Filter source (All/Claude/Cursor/Aider/Codex)
+- `g` Filter Gemini CLI
+- `6` Starred only
+- `s` Sync new prompts
+- `r` Refresh view
+- `c`/`y` Copy selected prompt
+- `f` Fork (launch agent)
+- `Enter` View full detail
+- `q` Quit
+"""
+        with Container(id="help-dialog"):
+            yield Label("[b]Help[/]", id="help-title")
+            yield Rule()
+            yield Markdown(help_md)
 
 
 class PromptDetailScreen(ModalScreen):
@@ -364,6 +441,29 @@ class PromptManagerApp(App):
     #fork-actions Button {
         margin: 0 1;
     }
+
+    /* Command Dialog */
+    #command-dialog {
+        width: 70%;
+        height: 70%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+
+    #command-filter {
+        width: 100%;
+        margin: 1 0;
+    }
+
+    /* Help Dialog */
+    #help-dialog {
+        width: 70%;
+        height: 70%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
     """
 
     BINDINGS = [
@@ -371,15 +471,20 @@ class PromptManagerApp(App):
         Binding("r", "refresh", "Refresh"),
         Binding("s", "sync", "Sync"),
         Binding("/", "focus_search", "Search"),
+        Binding("ctrl+p", "command_palette", "Commands"),
+        Binding("?", "help", "Help"),
         Binding("escape", "clear_filter", "Clear"),
         Binding("c", "copy_selected", "Copy"),
+        Binding("y", "copy_selected", "Copy"),
         Binding("f", "fork_session", "Fork"),
         Binding("enter", "view_detail", "View"),
         Binding("1", "filter_all", "All"),
         Binding("2", "filter_claude", "Claude"),
         Binding("3", "filter_cursor", "Cursor"),
-        Binding("4", "filter_codex", "Codex"),
-        Binding("5", "filter_starred", "Starred"),
+        Binding("4", "filter_aider", "Aider"),
+        Binding("5", "filter_codex", "Codex"),
+        Binding("g", "filter_gemini", "Gemini"),
+        Binding("6", "filter_starred", "Starred"),
     ]
 
     def __init__(self):
@@ -402,8 +507,10 @@ class PromptManagerApp(App):
                     yield Button("All", id="btn-all", variant="primary", classes="filter-active")
                     yield Button("Claude", id="btn-claude")
                     yield Button("Cursor", id="btn-cursor")
+                    yield Button("Aider", id="btn-aider")
                     yield Button("Codex", id="btn-codex")
-                    yield Button("*", id="btn-starred")
+                    yield Button("Gemini", id="btn-gemini")
+                    yield Button("★", id="btn-starred")
                 yield Static("", id="stats-bar")
                 yield Tree("Sessions", id="prompt-tree")
             with Vertical(id="right-panel"):
@@ -458,6 +565,7 @@ class PromptManagerApp(App):
             "cursor": "[magenta]Cu[/]",
             "codex": "[green]Cx[/]",
             "aider": "[yellow]A[/]",
+            "gemini_cli": "[blue]Gm[/]",
         }
 
         for source in sorted(grouped.keys()):
@@ -561,8 +669,9 @@ class PromptManagerApp(App):
         stats = get_stats(self.conn)
         stats_text = (
             f"{stats['total']} prompts | "
-            f"C:{stats['claude_code']} Cu:{stats['cursor']} Cx:{stats['codex']} | "
-            f"*:{stats['starred']}"
+            f"C:{stats['claude_code']} Cu:{stats['cursor']} A:{stats['aider']} "
+            f"Cx:{stats['codex']} Gm:{stats['gemini_cli']} | "
+            f"★:{stats['starred']}"
         )
         self.query_one("#stats-bar", Static).update(stats_text)
 
@@ -614,8 +723,8 @@ class PromptManagerApp(App):
 
         widgets.append(
             Horizontal(
-                Button("Copy [c]", classes="btn-copy", variant="primary"),
-                Button("Star", classes="btn-star", variant="warning"),
+                Button("Copy [c/y]", classes="btn-copy", variant="primary"),
+                Button("Unstar" if starred else "Star", classes="btn-star", variant="warning"),
                 Button("Fork [f]", classes="btn-fork", variant="success"),
                 Button("Full [Enter]", classes="btn-full"),
                 classes="preview-actions"
@@ -635,7 +744,40 @@ class PromptManagerApp(App):
         counts = sync_all(self.conn)
         self.load_prompts()
         self.update_stats()
+        self.update_preview(None)
         self.notify(f"Synced {counts['total']} new prompts")
+
+    def action_command_palette(self) -> None:
+        commands = [
+            ("sync", "Sync new prompts"),
+            ("refresh", "Refresh view"),
+            ("focus_search", "Focus search"),
+            ("clear_filter", "Clear search and filters"),
+            ("filter_all", "Show all sources"),
+            ("filter_claude", "Filter Claude Code"),
+            ("filter_cursor", "Filter Cursor"),
+            ("filter_aider", "Filter Aider"),
+            ("filter_codex", "Filter Codex"),
+            ("filter_gemini", "Filter Gemini CLI"),
+            ("filter_starred", "Starred only"),
+            ("quit", "Quit app"),
+        ]
+        self.push_screen(
+            CommandPaletteScreen(commands),
+            callback=self._on_command_palette_selected,
+        )
+
+    def _on_command_palette_selected(self, command_id: Optional[str]) -> None:
+        if not command_id:
+            return
+        method = getattr(self, f"action_{command_id}", None)
+        if callable(method):
+            method()
+        else:
+            self.notify(f"Unknown command: {command_id}", severity="error")
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
 
     def action_focus_search(self) -> None:
         self.query_one("#search-input", Input).focus()
@@ -647,6 +789,7 @@ class PromptManagerApp(App):
         self.starred_only = False
         self._update_filter_buttons()
         self.load_prompts()
+        self.update_preview(None)
 
     def action_copy_selected(self) -> None:
         if self.selected_prompt:
@@ -667,6 +810,7 @@ class PromptManagerApp(App):
     def _on_detail_close(self, refresh: bool = False) -> None:
         if refresh:
             self.load_prompts()
+            self.update_stats()
             self.update_preview(self.selected_prompt)
 
     def _set_filter(self, source: Optional[str], starred: bool = False) -> None:
@@ -681,7 +825,9 @@ class PromptManagerApp(App):
             "btn-all": (None, False),
             "btn-claude": ("claude_code", False),
             "btn-cursor": ("cursor", False),
+            "btn-aider": ("aider", False),
             "btn-codex": ("codex", False),
+            "btn-gemini": ("gemini_cli", False),
             "btn-starred": (None, True),
         }
 
@@ -702,8 +848,14 @@ class PromptManagerApp(App):
     def action_filter_cursor(self) -> None:
         self._set_filter("cursor")
 
+    def action_filter_aider(self) -> None:
+        self._set_filter("aider")
+
     def action_filter_codex(self) -> None:
         self._set_filter("codex")
+
+    def action_filter_gemini(self) -> None:
+        self._set_filter("gemini_cli")
 
     def action_filter_starred(self) -> None:
         self._set_filter(None, starred=True)
@@ -712,6 +864,7 @@ class PromptManagerApp(App):
     def on_search_changed(self, event: Input.Changed) -> None:
         self.search_query = event.value
         self.load_prompts()
+        self.update_preview(None)
 
     @on(Tree.NodeSelected, "#prompt-tree")
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
@@ -733,9 +886,17 @@ class PromptManagerApp(App):
     def on_cursor(self) -> None:
         self.action_filter_cursor()
 
+    @on(Button.Pressed, "#btn-aider")
+    def on_aider(self) -> None:
+        self.action_filter_aider()
+
     @on(Button.Pressed, "#btn-codex")
     def on_codex(self) -> None:
         self.action_filter_codex()
+
+    @on(Button.Pressed, "#btn-gemini")
+    def on_gemini(self) -> None:
+        self.action_filter_gemini()
 
     @on(Button.Pressed, "#btn-starred")
     def on_starred(self) -> None:
@@ -752,6 +913,7 @@ class PromptManagerApp(App):
             self.selected_prompt["starred"] = new_status
             self.notify("Starred!" if new_status else "Unstarred")
             self.load_prompts()
+            self.update_stats()
             self.update_preview(self.selected_prompt)
 
     @on(Button.Pressed, ".btn-full")
@@ -789,12 +951,20 @@ class PromptManagerApp(App):
                 cmd = ["claude"]
         elif source == "codex":
             # Codex: simple launch (no fork support known)
-            work_dir = os.path.expanduser("~")
+            work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
             cmd = ["codex"]
+        elif source == "aider":
+            # Aider: launch in project directory if available
+            work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
+            cmd = ["aider"]
         elif source == "cursor":
             # Cursor: open in project directory
             work_dir = os.path.expanduser("~")
             cmd = ["cursor", "."]
+        elif source == "gemini_cli":
+            # Gemini CLI: start a new session (no reliable resume command inferred)
+            work_dir = os.path.expanduser("~")
+            cmd = ["gemini"]
         else:
             self.notify(f"Unknown source: {source}", severity="error")
             return

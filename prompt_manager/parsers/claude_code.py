@@ -114,8 +114,20 @@ class ClaudeCodeParser(BaseParser):
                     next_msg = next_data.get("message", {})
                     if next_msg.get("role") == "user":
                         next_content = next_msg.get("content")
-                        # Check if it's actual user input, not tool result
-                        if isinstance(next_content, str) and len(next_content.strip()) >= 10:
+                        # Check if it's actual user input (text blocks), not tool results
+                        next_text = None
+                        if isinstance(next_content, str):
+                            next_text = next_content
+                        elif isinstance(next_content, list):
+                            text_parts = [
+                                item.get("text", "")
+                                for item in next_content
+                                if isinstance(item, dict) and item.get("type") == "text"
+                            ]
+                            if text_parts:
+                                next_text = "\n".join(text_parts)
+
+                        if next_text and len(next_text.strip()) >= 10:
                             break
 
                 # Extract assistant text response

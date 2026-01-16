@@ -11,6 +11,7 @@ A TUI tool to manage and search prompts from various AI coding assistants.
   - Cursor (SQLite with Protobuf)
   - Codex CLI (session rollouts)
   - Aider (markdown logs)
+  - Gemini CLI (session JSON)
 - Full-text search across all prompts
 - Tree-based navigation by source/project/session
 - Preview prompts and responses with Markdown rendering
@@ -62,10 +63,15 @@ prompt-manager
 
 | Key | Action |
 |-----|--------|
+| `ctrl+p` | Command palette |
+| `?` | Help |
 | `/` | Focus search |
-| `1-5` | Filter by source |
+| `1-5` | Filter by source (All/Claude/Cursor/Aider/Codex) |
+| `g` | Filter Gemini CLI |
+| `6` | Filter starred |
 | `s` | Sync new prompts |
-| `c` | Copy selected prompt |
+| `r` | Refresh view |
+| `c` / `y` | Copy selected prompt |
 | `f` | Fork session |
 | `Enter` | View full detail |
 | `q` | Quit |
@@ -75,9 +81,10 @@ prompt-manager
 - Database: `~/.prompt-manager/prompts.duckdb`
 - Parsed from:
   - `~/.claude/projects/` (Claude Code)
-  - `~/.cursor/chats/` (Cursor)
+  - `~/.cursor/chats/` and Cursor globalStorage `state.vscdb` (Cursor)
   - `~/.codex/sessions/` (Codex)
   - `~/.aider.chat.history.md` (Aider)
+  - `~/.gemini/tmp/**/chats/` (Gemini CLI)
 
 ## Tech Stack
 

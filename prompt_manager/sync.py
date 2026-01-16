@@ -11,6 +11,7 @@ from .parsers.claude_code import ClaudeCodeParser
 from .parsers.cursor import CursorParser
 from .parsers.aider import AiderParser
 from .parsers.codex import CodexParser
+from .parsers.gemini_cli import GeminiCliParser
 
 
 def _init_file_state_table(conn: duckdb.DuckDBPyConnection) -> None:
@@ -94,7 +95,7 @@ def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path:
 
     except Exception as e:
         # Log error but don't crash - return -1 to indicate failure
-        print(f"Error parsing {file_path}: {e}")
+        print(f"Error syncing {file_path}: {e}")
         return -1
 
 
@@ -118,6 +119,7 @@ def sync_all(conn: Optional[duckdb.DuckDBPyConnection] = None, force: bool = Fal
         "cursor": 0,
         "aider": 0,
         "codex": 0,
+        "gemini_cli": 0,
         "total": 0,
         "files_checked": 0,
         "files_updated": 0,
@@ -128,6 +130,7 @@ def sync_all(conn: Optional[duckdb.DuckDBPyConnection] = None, force: bool = Fal
         CursorParser(),
         AiderParser(),
         CodexParser(),
+        GeminiCliParser(),
     ]
 
     for parser in parsers:
@@ -165,6 +168,7 @@ def sync_source(source: str, conn: Optional[duckdb.DuckDBPyConnection] = None, f
         "cursor": CursorParser,
         "aider": AiderParser,
         "codex": CodexParser,
+        "gemini_cli": GeminiCliParser,
     }
 
     if source not in parser_map:
@@ -200,6 +204,7 @@ def check_updates(conn: Optional[duckdb.DuckDBPyConnection] = None) -> dict:
         "cursor": 0,
         "aider": 0,
         "codex": 0,
+        "gemini_cli": 0,
     }
 
     parsers = [
@@ -207,6 +212,7 @@ def check_updates(conn: Optional[duckdb.DuckDBPyConnection] = None) -> dict:
         CursorParser(),
         AiderParser(),
         CodexParser(),
+        GeminiCliParser(),
     ]
 
     for parser in parsers:
