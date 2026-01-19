@@ -359,6 +359,8 @@ def sync_all(
         "total": 0,
         "files_checked": 0,
         "files_updated": 0,
+        "files_skipped": 0,
+        "files_failed": 0,
     }
 
     active_parsers = parsers or [
@@ -482,6 +484,9 @@ def sync_all(
                 counts["total"] += result
             else:
                 error = "sync failed"
+                counts["files_failed"] += 1
+        else:
+            counts["files_skipped"] += 1
 
         if progress_callback:
             progress_callback(
