@@ -155,36 +155,39 @@ class ClaudeCodeParser(BaseParser):
                 turn_json=turn_json,
             )
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(data, dict):
-                    continue
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
 
-                user_text = is_user_prompt(data)
-                if user_text is not None:
-                    flushed = flush_pending()
-                    if flushed is not None:
-                        yield flushed
+                    user_text = is_user_prompt(data)
+                    if user_text is not None:
+                        flushed = flush_pending()
+                        if flushed is not None:
+                            yield flushed
 
-                    pending_content = user_text
-                    pending_ts_str = data.get("timestamp") or ""
-                    pending_timestamp = self.parse_timestamp(pending_ts_str)
-                    pending_response_parts = []
-                    pending_turn_lines = [data]
-                    continue
+                        pending_content = user_text
+                        pending_ts_str = data.get("timestamp") or ""
+                        pending_timestamp = self.parse_timestamp(pending_ts_str)
+                        pending_response_parts = []
+                        pending_turn_lines = [data]
+                        continue
 
-                if pending_content is None:
-                    continue
+                    if pending_content is None:
+                        continue
 
-                pending_turn_lines.append(data)
-                pending_response_parts.extend(extract_assistant_text(data))
+                    pending_turn_lines.append(data)
+                    pending_response_parts.extend(extract_assistant_text(data))
+        except OSError:
+            return
 
         flushed = flush_pending()
         if flushed is not None:

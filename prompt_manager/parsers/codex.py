@@ -49,10 +49,13 @@ class CodexParser(BaseParser):
 
     def parse_file(self, file_path: Path) -> Iterator[ParsedPrompt]:
         """Parse a Codex rollout file."""
-        if file_path.suffix == ".json":
-            yield from self._parse_json_rollout(file_path)
+        try:
+            if file_path.suffix == ".json":
+                yield from self._parse_json_rollout(file_path)
+                return
+            yield from self._parse_jsonl_rollout(file_path)
+        except OSError:
             return
-        yield from self._parse_jsonl_rollout(file_path)
 
     def _parse_jsonl_rollout(self, file_path: Path) -> Iterator[ParsedPrompt]:
         """Parse Codex JSONL rollout file."""
@@ -193,7 +196,10 @@ class CodexParser(BaseParser):
 
     def _parse_json_rollout(self, file_path: Path) -> Iterator[ParsedPrompt]:
         """Parse legacy Codex rollouts stored as a single JSON document."""
-        data = json.loads(file_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
 
         if not isinstance(data, dict):
             return

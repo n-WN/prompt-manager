@@ -55,8 +55,11 @@ class AiderParser(BaseParser):
         session_id = None
         current_timestamp = None
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            return
 
         # Split by chat sessions
         sessions = re.split(r'^# aider chat started at (.+)$', content, flags=re.MULTILINE)

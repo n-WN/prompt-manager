@@ -284,6 +284,14 @@ class TestCodexParser(unittest.TestCase):
             self.assertNotIn("short2", seg0)
             self.assertIn("short2", seg1)
 
+    def test_ignores_invalid_legacy_rollout_json(self) -> None:
+        parser = CodexParser(base_path=Path("/does/not/matter"))
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.json"
+            rollout.write_text("{not json", encoding="utf-8")
+            prompts = list(parser.parse_file(rollout))
+            self.assertEqual(prompts, [])
+
 
 class TestAmpParser(unittest.TestCase):
     def test_parses_thread_json_and_skips_tool_result_user_messages(self) -> None:
