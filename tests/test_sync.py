@@ -19,7 +19,7 @@ class _DummyParser(BaseParser):
     def find_log_files(self):
         yield self._file_path
 
-    def parse_file(self, file_path: Path):
+    def parse_file(self, _file_path: Path):
         yield ParsedPrompt(
             id=self.generate_id(self.source_name, "hello", "sess", "t0"),
             source=self.source_name,

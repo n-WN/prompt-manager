@@ -315,16 +315,20 @@ def sync_all(
 
         if needs_sync:
             counts["files_updated"] += 1
+            current_files_updated = counts["files_updated"]
+            current_source = parser.source_name
+            current_file_path = file_path
+            current_idx = idx
 
             if progress_callback:
                 progress_callback(
                     SyncProgress(
                         phase="syncing",
-                        source=parser.source_name,
-                        file_path=file_path,
-                        files_checked=idx,
+                        source=current_source,
+                        file_path=current_file_path,
+                        files_checked=current_idx,
                         files_total=files_total,
-                        files_updated=counts["files_updated"],
+                        files_updated=current_files_updated,
                         new_prompts_total=counts["total"],
                         new_prompts_in_file=0,
                         file_items_done=0,
@@ -332,18 +336,27 @@ def sync_all(
                     )
                 )
 
-            def emit_file_progress(items_done: int, inserted_so_far: int) -> None:
-                if not progress_callback:
+            progress = progress_callback
+
+            def emit_file_progress(
+                items_done: int,
+                inserted_so_far: int,
+                *,
+                _source: str = current_source,
+                _file_path: Path = current_file_path,
+                _idx: int = current_idx,
+            ) -> None:
+                if progress is None:
                     return
-                progress_callback(
+                progress(
                     SyncProgress(
                         phase="syncing",
-                        source=parser.source_name,
-                        file_path=file_path,
-                        files_checked=idx,
+                        source=_source,
+                        file_path=_file_path,
+                        files_checked=_idx,
                         files_total=files_total,
-                        files_updated=counts["files_updated"],
-                        new_prompts_total=counts["total"],
+                        files_updated=current_files_updated,
+                        new_prompts_total=counts["total"] + inserted_so_far,
                         new_prompts_in_file=inserted_so_far,
                         file_items_done=items_done,
                         skipped=False,
