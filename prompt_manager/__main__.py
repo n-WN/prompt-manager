@@ -3,6 +3,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 
 def main():
@@ -44,6 +45,19 @@ def main():
 
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Show statistics")
+
+    # Codex transcript (from rollout jsonl)
+    codex_transcript_parser = subparsers.add_parser(
+        "codex-transcript",
+        help="Print a Codex rollout transcript (matches Codex CLI view)",
+    )
+    codex_transcript_parser.add_argument("path", help="Path to rollout-*.jsonl")
+    codex_transcript_parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Wrap width (defaults to terminal width)",
+    )
 
     args = parser.parse_args()
 
@@ -110,6 +124,16 @@ def main():
         print(f"  Gemini CLI:     {stats['gemini_cli']}")
         print(f"Starred:          {stats['starred']}")
         print(f"Total uses:       {stats['total_uses']}")
+
+    elif args.command == "codex-transcript":
+        from .codex_transcript import format_codex_rollout_transcript
+
+        path = Path(args.path).expanduser()
+        if not path.exists():
+            print(f"File not found: {path}", file=sys.stderr)
+            sys.exit(2)
+
+        sys.stdout.write(format_codex_rollout_transcript(path, width=args.width))
 
 
 if __name__ == "__main__":

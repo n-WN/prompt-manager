@@ -19,6 +19,7 @@ class ParsedPrompt:
     session_id: Optional[str] = None
     timestamp: Optional[datetime] = None
     response: Optional[str] = None
+    turn_json: Optional[str] = None
 
 
 class BaseParser(ABC):

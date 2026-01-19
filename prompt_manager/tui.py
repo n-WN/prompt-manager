@@ -4,7 +4,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
     Header, Footer, Static, Input, Button, Label, Tree, TextArea,
-    Rule, OptionList, ContentSwitcher, Markdown
+    Rule, OptionList, ContentSwitcher, Markdown, ProgressBar
 )
 from textual.widgets.tree import TreeNode
 from textual.widgets.option_list import Option
@@ -15,12 +15,24 @@ from textual.screen import ModalScreen
 from datetime import datetime
 from typing import Optional
 from collections import defaultdict
+import platform
 import pyperclip
+import shlex
+import shutil
 import subprocess
 import os
+import threading
 
-from .db import get_connection, search_prompts, toggle_star, increment_use_count, get_stats
-from .sync import sync_all
+from .db import (
+    get_connection,
+    get_prompt,
+    get_stats,
+    increment_use_count,
+    search_prompt_summaries,
+    toggle_star,
+)
+from .codex_transcript import format_codex_turn_json
+from .sync import SyncProgress, rebuild_database, sync_all
 
 
 class ForkConfirmScreen(ModalScreen):
@@ -49,14 +61,18 @@ class ForkConfirmScreen(ModalScreen):
                 cmd = "claude"
                 desc = "Launch Claude Code CLI"
         elif source == "codex":
-            cmd = "codex"
-            desc = "Launch Codex CLI (new session)"
+            if session_id and session_id != "N/A":
+                cmd = f"codex fork {session_id}"
+                desc = "Fork a new Codex session from saved history"
+            else:
+                cmd = "codex"
+                desc = "Launch Codex CLI (new session)"
         elif source == "aider":
             cmd = "aider"
             desc = "Launch Aider (new chat in project directory)"
         elif source == "cursor":
             cmd = "cursor ."
-            desc = "Open Cursor IDE"
+            desc = "Open Cursor IDE in project directory"
         elif source == "gemini_cli":
             cmd = "gemini"
             desc = "Launch Gemini CLI (new session)"
@@ -89,6 +105,113 @@ class ForkConfirmScreen(ModalScreen):
     def on_cancel(self) -> None:
         self.dismiss(False)
 
+
+class SyncProgressScreen(ModalScreen):
+    """Modal progress UI for sync / rebuild operations."""
+
+    DEFAULT_CSS = """
+    SyncProgressScreen {
+        align: center middle;
+    }
+
+    #sync-dialog {
+        width: 80%;
+        max-width: 100;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+
+    #sync-title {
+        text-style: bold;
+        content-align: center middle;
+        height: 1;
+    }
+
+    #sync-status {
+        height: auto;
+        color: $text-muted;
+        margin: 1 0;
+    }
+
+    #sync-progress {
+        height: 1;
+    }
+    """
+
+    def __init__(self, title: str):
+        super().__init__()
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with Container(id="sync-dialog"):
+            yield Label(self._title, id="sync-title")
+            yield Rule()
+            yield Static("", id="sync-status")
+            yield ProgressBar(total=1, id="sync-progress")
+
+    def update_progress(self, progress: SyncProgress) -> None:
+        total = max(progress.files_total, 1)
+        self.query_one("#sync-progress", ProgressBar).update(
+            total=total, progress=min(progress.files_checked, total)
+        )
+
+        file_label = ""
+        if progress.file_path and str(progress.file_path) not in {".", ""}:
+            file_label = str(progress.file_path)
+
+        phase = progress.phase
+        skipped = " (skipped)" if progress.skipped else ""
+        error = f" [error: {progress.error}]" if progress.error else ""
+
+        status = (
+            f"{phase} | {progress.files_checked}/{progress.files_total} files | "
+            f"updated={progress.files_updated} | new_prompts={progress.new_prompts_total}"
+        )
+        if progress.source:
+            status += f" | source={progress.source}"
+        if file_label:
+            status += f"\n{file_label}{skipped}{error}"
+        self.query_one("#sync-status", Static).update(status)
+
+
+class RebuildConfirmScreen(ModalScreen):
+    """Confirmation dialog for rebuilding the database."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Cancel"),
+        Binding("enter", "confirm", "Confirm"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        md = """\
+## Rebuild database
+
+This will clear the prompt index and re-import all logs.
+
+- Preserves: `starred`, `tags`, `use_count` (matched by prompt id)
+- Rebuilds: prompts/responses/timelines from sources on disk
+
+Continue?
+"""
+        with Container(id="fork-dialog"):
+            yield Label("[b]Rebuild Database[/]", id="fork-title")
+            yield Rule()
+            yield Markdown(md)
+            with Horizontal(id="fork-actions"):
+                yield Button("Rebuild [Enter]", id="btn-rebuild-confirm", variant="warning")
+                yield Button("Cancel [Esc]", id="btn-rebuild-cancel", variant="default")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-rebuild-confirm")
+    def on_confirm(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-rebuild-cancel")
+    def on_cancel(self) -> None:
+        self.dismiss(False)
 
 class CommandPaletteScreen(ModalScreen):
     """Command palette similar to OpenCode's command list."""
@@ -176,11 +299,23 @@ class PromptDetailScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         content = self.prompt.get("content", "")
+        response = self.prompt.get("response") or ""
         source = self.prompt.get("source", "unknown")
         project = self.prompt.get("project_path", "N/A")
         timestamp = self.prompt.get("timestamp")
         starred = self.prompt.get("starred", False)
         session = self.prompt.get("session_id", "N/A")
+        prompt_id = self.prompt.get("id")
+
+        turn_json = None
+        if prompt_id:
+            try:
+                conn = getattr(self.app, "conn", None) or get_connection()
+                full_prompt = get_prompt(conn, prompt_id)
+                if full_prompt:
+                    turn_json = full_prompt.get("turn_json")
+            except Exception:
+                turn_json = None
 
         ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S") if timestamp else "N/A"
         star_icon = "[yellow]*[/]" if starred else ""
@@ -195,7 +330,22 @@ class PromptDetailScreen(ModalScreen):
             yield Static(f"[b]Session:[/] {session[:20]}..." if session else "", id="detail-session")
             yield Rule()
             with VerticalScroll(id="detail-content"):
+                yield Static("[b]Prompt:[/]", classes="section-label")
                 yield Markdown(content)
+                if response:
+                    yield Rule()
+                    yield Static("[b]Response:[/]", classes="section-label")
+                    yield Markdown(response)
+                if turn_json:
+                    yield Rule()
+                    if source == "codex":
+                        yield Static("[b]Codex output (turn):[/]", classes="section-label")
+                        transcript = format_codex_turn_json(turn_json, width=100)
+                        if transcript:
+                            yield Markdown(transcript)
+                            yield Rule()
+                    yield Static("[b]Turn timeline (raw JSON):[/]", classes="section-label")
+                    yield Markdown(f"```json\n{turn_json}\n```")
             with Horizontal(id="detail-actions"):
                 yield Button("Copy", id="btn-copy", variant="primary")
                 yield Button("Star" if not starred else "Unstar", id="btn-star", variant="warning")
@@ -536,7 +686,7 @@ class PromptManagerApp(App):
 
     def load_prompts(self) -> None:
         """Load prompts and build tree by session."""
-        self.prompts = search_prompts(
+        self.prompts = search_prompt_summaries(
             self.conn,
             query=self.search_query if self.search_query else None,
             source=self.current_filter,
@@ -740,16 +890,74 @@ class PromptManagerApp(App):
         self.notify("Refreshed")
 
     def action_sync(self) -> None:
-        self.notify("Syncing...")
-        counts = sync_all(self.conn)
+        self._start_sync_job(rebuild=False)
+
+    def action_rebuild(self) -> None:
+        self.push_screen(RebuildConfirmScreen(), callback=self._on_rebuild_confirm)
+
+    def _on_rebuild_confirm(self, confirmed: bool) -> None:
+        if confirmed:
+            self._start_sync_job(rebuild=True)
+
+    def _start_sync_job(self, rebuild: bool) -> None:
+        title = "Rebuilding database..." if rebuild else "Syncing..."
+        screen = SyncProgressScreen(title)
+        self.push_screen(screen)
+
+        def on_progress(progress: SyncProgress) -> None:
+            self.call_from_thread(screen.update_progress, progress)
+
+        def worker() -> None:
+            conn = get_connection()
+            try:
+                if rebuild:
+                    counts = rebuild_database(conn, progress_callback=on_progress)
+                else:
+                    counts = sync_all(conn, progress_callback=on_progress)
+                self.call_from_thread(self._on_sync_complete, screen, counts, rebuild)
+            except Exception as e:
+                self.call_from_thread(self._on_sync_failed, screen, str(e))
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_sync_complete(self, screen: SyncProgressScreen, counts: dict, rebuild: bool) -> None:
+        try:
+            screen.dismiss()
+        except Exception:
+            pass
+
+        # Refresh connection so the UI sees all changes.
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = get_connection()
+
         self.load_prompts()
         self.update_stats()
         self.update_preview(None)
-        self.notify(f"Synced {counts['total']} new prompts")
+
+        if rebuild:
+            self.notify(f"Rebuilt database: {counts.get('total', 0)} prompts")
+        else:
+            self.notify(f"Synced {counts.get('total', 0)} new prompts")
+
+    def _on_sync_failed(self, screen: SyncProgressScreen, error: str) -> None:
+        try:
+            screen.dismiss()
+        except Exception:
+            pass
+        self.notify(f"Sync failed: {error}", severity="error")
 
     def action_command_palette(self) -> None:
         commands = [
             ("sync", "Sync new prompts"),
+            ("rebuild", "Rebuild database (force re-import)"),
             ("refresh", "Refresh view"),
             ("focus_search", "Focus search"),
             ("clear_filter", "Clear search and filters"),
@@ -869,10 +1077,21 @@ class PromptManagerApp(App):
     @on(Tree.NodeSelected, "#prompt-tree")
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         node = event.node
-        if node.data and node.data in self.prompt_map:
-            self.update_preview(self.prompt_map[node.data])
-        else:
+        if not node.data or node.data not in self.prompt_map:
             self.update_preview(None)
+            return
+
+        prompt_id = node.data
+        cached = self.prompt_map[prompt_id]
+
+        # Summaries intentionally omit `response`. Load full prompt lazily on select.
+        if "response" not in cached:
+            full = get_prompt(self.conn, prompt_id)
+            if full:
+                self.prompt_map[prompt_id] = full
+                cached = full
+
+        self.update_preview(cached)
 
     @on(Button.Pressed, "#btn-all")
     def on_all(self) -> None:
@@ -950,16 +1169,16 @@ class PromptManagerApp(App):
             else:
                 cmd = ["claude"]
         elif source == "codex":
-            # Codex: simple launch (no fork support known)
+            # Codex: fork the saved session (Codex CLI supports `codex fork <SESSION_ID>`)
             work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
-            cmd = ["codex"]
+            cmd = ["codex", "fork", session_id] if session_id else ["codex"]
         elif source == "aider":
             # Aider: launch in project directory if available
             work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
             cmd = ["aider"]
         elif source == "cursor":
-            # Cursor: open in project directory
-            work_dir = os.path.expanduser("~")
+            # Cursor: open in project directory when available
+            work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
             cmd = ["cursor", "."]
         elif source == "gemini_cli":
             # Gemini CLI: start a new session (no reliable resume command inferred)
@@ -973,46 +1192,99 @@ class PromptManagerApp(App):
         if not os.path.isdir(work_dir):
             work_dir = os.path.expanduser("~")
 
+        pretty_cmd = f"cd {shlex.quote(work_dir)} && " + " ".join(
+            shlex.quote(str(part)) for part in cmd
+        )
+
         try:
             # Launch in new terminal
             self._launch_in_terminal(cmd, work_dir)
             if source == "claude_code" and session_id:
                 self.notify(f"Forking session {session_id[:8]}... in {work_dir}")
+            elif source == "codex" and session_id:
+                self.notify(f"Forking Codex session {session_id[:8]}... in {work_dir}")
             else:
                 self.notify(f"Launching {source} in {work_dir}")
         except Exception as e:
-            self.notify(f"Launch failed: {e}", severity="error")
+            try:
+                pyperclip.copy(pretty_cmd)
+                self.notify(
+                    f"Launch failed: {e} (command copied to clipboard)",
+                    severity="error",
+                )
+            except Exception:
+                self.notify(f"Launch failed: {e} (run: {pretty_cmd})", severity="error")
 
     def _launch_in_terminal(self, cmd: list, work_dir: str) -> None:
         """Launch command in a new terminal window."""
-        import platform
 
-        if platform.system() == "Darwin":
-            # macOS - use osascript to open Terminal
-            script = f'''
-            tell application "Terminal"
-                activate
-                do script "cd '{work_dir}' && {' '.join(cmd)}"
-            end tell
-            '''
+        def shell_join(argv: list[str]) -> str:
+            return " ".join(shlex.quote(str(part)) for part in argv)
+
+        def applescript_string(text: str) -> str:
+            return text.replace("\\", "\\\\").replace('"', '\\"')
+
+        shell_cmd = f"cd {shlex.quote(work_dir)} && {shell_join(cmd)}"
+
+        # If we're inside tmux, prefer opening a new tmux window/tab.
+        if os.environ.get("TMUX") and shutil.which("tmux"):
+            subprocess.Popen(["tmux", "new-window", "-c", work_dir, shell_cmd])
+            return
+
+        system = platform.system()
+        if system == "Darwin":
+            term_program = os.environ.get("TERM_PROGRAM", "")
+            if term_program == "iTerm.app":
+                script = f'''
+                tell application "iTerm"
+                    activate
+                    create window with default profile
+                    tell current session of current window
+                        write text "{applescript_string(shell_cmd)}"
+                    end tell
+                end tell
+                '''
+            else:
+                script = f'''
+                tell application "Terminal"
+                    activate
+                    do script "{applescript_string(shell_cmd)}"
+                end tell
+                '''
             subprocess.Popen(["osascript", "-e", script])
-        elif platform.system() == "Linux":
-            # Linux - try common terminals
-            terminals = [
-                ["gnome-terminal", "--", "bash", "-c", f"cd '{work_dir}' && {' '.join(cmd)}; exec bash"],
-                ["xterm", "-e", f"cd '{work_dir}' && {' '.join(cmd)}; bash"],
-                ["konsole", "-e", f"cd '{work_dir}' && {' '.join(cmd)}"],
+            return
+
+        if system == "Linux":
+            # Prefer modern terminals that support passing argv directly when available.
+            direct = [
+                ("wezterm", ["wezterm", "start", "--cwd", work_dir, "--", *cmd]),
+                ("kitty", ["kitty", "--directory", work_dir, *cmd]),
+                ("alacritty", ["alacritty", "--working-directory", work_dir, "-e", *cmd]),
             ]
-            for term_cmd in terminals:
-                try:
+            for exe, term_cmd in direct:
+                if shutil.which(exe):
                     subprocess.Popen(term_cmd)
                     return
-                except FileNotFoundError:
-                    continue
+
+            # Fallback to terminals that require a shell string.
+            bash_cmd = f"{shell_cmd}; exec bash"
+            candidates = [
+                ("x-terminal-emulator", ["x-terminal-emulator", "-e", "bash", "-lc", bash_cmd]),
+                ("gnome-terminal", ["gnome-terminal", "--", "bash", "-lc", bash_cmd]),
+                ("konsole", ["konsole", "-e", "bash", "-lc", bash_cmd]),
+                ("xterm", ["xterm", "-e", "bash", "-lc", bash_cmd]),
+            ]
+            for exe, term_cmd in candidates:
+                if shutil.which(exe):
+                    subprocess.Popen(term_cmd)
+                    return
             raise RuntimeError("No supported terminal found")
-        else:
-            # Windows or other
-            subprocess.Popen(cmd, cwd=work_dir, shell=True)
+
+        # Windows or other: best-effort, run detached in a new process group.
+        try:
+            subprocess.Popen(cmd, cwd=work_dir, start_new_session=True)
+        except TypeError:
+            subprocess.Popen(cmd, cwd=work_dir)
 
 
 def main():
