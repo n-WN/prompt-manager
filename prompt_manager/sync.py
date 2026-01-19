@@ -311,7 +311,7 @@ def _sync_file(
             try:
                 conn.execute("CHECKPOINT")
             except Exception:
-                pass
+                logging.exception("CHECKPOINT failed after syncing %s", file_path)
         if progress:
             progress(items_done, count)
         return count
@@ -529,6 +529,7 @@ def rebuild_database(
                 """
             )
         except Exception:
+            logging.exception("failed to preserve prompt metadata; rebuild will not restore starred/tags/use_count")
             preserve_metadata = False
 
     if progress_callback:

@@ -40,8 +40,8 @@ def get_recovered_db_path(db_path: Optional[Path] = None) -> Path:
 
 
 def _is_wal_replay_error(error: Exception) -> bool:
-    msg = str(error)
-    return "Failure while replaying WAL file" in msg
+    msg = str(error).lower()
+    return "replaying wal file" in msg or ("wal" in msg and "replay" in msg and "failure" in msg)
 
 
 def _wants_store_blobs() -> bool:

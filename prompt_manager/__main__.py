@@ -55,8 +55,8 @@ def main():
     stats_parser = subparsers.add_parser("stats", help="Show statistics")
 
     # Database info / diagnostics
-    db_info_parser = subparsers.add_parser("db-info", help="Show database file sizes and status")
-    db_analyze_parser = subparsers.add_parser("db-analyze", help="Analyze column storage sizes in the DB")
+    subparsers.add_parser("db-info", help="Show database file sizes and status")
+    subparsers.add_parser("db-analyze", help="Analyze column storage sizes in the DB")
     db_clean_parser = subparsers.add_parser("db-clean", help="Clean old DB/WAL files in ~/.prompt-manager")
     db_clean_parser.add_argument(
         "--yes",
