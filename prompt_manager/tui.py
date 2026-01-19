@@ -1231,10 +1231,15 @@ class PromptManagerApp(App):
         session_id = self.selected_prompt.get("session_id") or ""
 
         def resolve_work_dir(project_path: str) -> str:
-            if ":" in project_path:
-                _, candidate = project_path.split(":", 1)
+            # Preserve Windows drive letters like "C:\\..." and "C:/...".
+            if len(project_path) >= 3 and project_path[1] == ":" and project_path[0].isalpha():
+                return project_path if os.path.isdir(project_path) else os.path.expanduser("~")
+
+            if project_path.startswith("cursor:"):
+                candidate = project_path.split(":", 1)[1]
                 if candidate and os.path.isdir(candidate):
                     return candidate
+
             return project_path if os.path.isdir(project_path) else os.path.expanduser("~")
 
         # Determine working directory and command
