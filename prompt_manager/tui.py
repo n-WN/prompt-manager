@@ -19,7 +19,7 @@ import pyperclip
 import subprocess
 import os
 
-from .db import get_connection, search_prompts, toggle_star, increment_use_count, get_stats
+from .db import get_connection, search_prompts, toggle_star, increment_use_count, get_stats, get_prompt
 from .sync import sync_all
 
 
@@ -176,11 +176,23 @@ class PromptDetailScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         content = self.prompt.get("content", "")
+        response = self.prompt.get("response") or ""
         source = self.prompt.get("source", "unknown")
         project = self.prompt.get("project_path", "N/A")
         timestamp = self.prompt.get("timestamp")
         starred = self.prompt.get("starred", False)
         session = self.prompt.get("session_id", "N/A")
+        prompt_id = self.prompt.get("id")
+
+        turn_json = None
+        if prompt_id:
+            try:
+                conn = getattr(self.app, "conn", None) or get_connection()
+                full_prompt = get_prompt(conn, prompt_id)
+                if full_prompt:
+                    turn_json = full_prompt.get("turn_json")
+            except Exception:
+                turn_json = None
 
         ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S") if timestamp else "N/A"
         star_icon = "[yellow]*[/]" if starred else ""
@@ -195,7 +207,16 @@ class PromptDetailScreen(ModalScreen):
             yield Static(f"[b]Session:[/] {session[:20]}..." if session else "", id="detail-session")
             yield Rule()
             with VerticalScroll(id="detail-content"):
+                yield Static("[b]Prompt:[/]", classes="section-label")
                 yield Markdown(content)
+                if response:
+                    yield Rule()
+                    yield Static("[b]Response:[/]", classes="section-label")
+                    yield Markdown(response)
+                if turn_json:
+                    yield Rule()
+                    yield Static("[b]Turn timeline (raw JSON):[/]", classes="section-label")
+                    yield Markdown(f"```json\n{turn_json}\n```")
             with Horizontal(id="detail-actions"):
                 yield Button("Copy", id="btn-copy", variant="primary")
                 yield Button("Star" if not starred else "Unstar", id="btn-star", variant="warning")

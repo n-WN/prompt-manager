@@ -26,6 +26,7 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             session_id VARCHAR,                -- Session/conversation ID
             content TEXT NOT NULL,             -- The actual prompt text
             response TEXT,                     -- LLM response text
+            turn_json TEXT,                    -- Per-turn raw timeline (JSON)
             timestamp TIMESTAMP,               -- When the prompt was created
             tags VARCHAR[],                    -- User-defined tags
             starred BOOLEAN DEFAULT FALSE,     -- User favorites
@@ -38,6 +39,12 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     # Add response column if not exists (for existing databases)
     try:
         conn.execute("ALTER TABLE prompts ADD COLUMN response TEXT")
+    except Exception:
+        pass  # Column already exists
+
+    # Add turn_json column if not exists (for existing databases)
+    try:
+        conn.execute("ALTER TABLE prompts ADD COLUMN turn_json TEXT")
     except Exception:
         pass  # Column already exists
 
@@ -79,6 +86,7 @@ def insert_prompt(
     session_id: Optional[str] = None,
     timestamp: Optional[datetime] = None,
     response: Optional[str] = None,
+    turn_json: Optional[str] = None,
 ) -> bool:
     """Insert a prompt if it doesn't exist.
 
@@ -87,28 +95,29 @@ def insert_prompt(
     """
     inserted = conn.execute(
         """
-        INSERT INTO prompts (id, source, project_path, session_id, content, timestamp, response)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO prompts (id, source, project_path, session_id, content, timestamp, response, turn_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (id) DO NOTHING
         RETURNING id
         """,
-        [id, source, project_path, session_id, content, timestamp, response],
+        [id, source, project_path, session_id, content, timestamp, response, turn_json],
     ).fetchone()
 
     if inserted:
         return True
 
-    # Existing prompt: opportunistically fill in missing response without
+    # Existing prompt: opportunistically fill in missing fields without
     # counting it as a "new prompt" for sync stats.
-    if response:
+    if response or turn_json:
         conn.execute(
             """
             UPDATE prompts
             SET response = COALESCE(response, ?),
+                turn_json = COALESCE(turn_json, ?),
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            [response, id],
+            [response, turn_json, id],
         )
 
     return False
@@ -151,6 +160,38 @@ def search_prompts(
     columns = ['id', 'source', 'project_path', 'session_id', 'content',
                'timestamp', 'tags', 'starred', 'use_count', 'created_at', 'response']
     return [dict(zip(columns, row)) for row in result]
+
+
+def get_prompt(conn: duckdb.DuckDBPyConnection, prompt_id: str) -> Optional[dict]:
+    """Get a single prompt by ID (includes turn_json when available)."""
+    result = conn.execute(
+        """
+        SELECT id, source, project_path, session_id, content, timestamp,
+               tags, starred, use_count, created_at, response, turn_json
+        FROM prompts
+        WHERE id = ?
+        """,
+        [prompt_id],
+    ).fetchone()
+
+    if not result:
+        return None
+
+    columns = [
+        "id",
+        "source",
+        "project_path",
+        "session_id",
+        "content",
+        "timestamp",
+        "tags",
+        "starred",
+        "use_count",
+        "created_at",
+        "response",
+        "turn_json",
+    ]
+    return dict(zip(columns, result))
 
 
 def toggle_star(conn: duckdb.DuckDBPyConnection, prompt_id: str) -> bool:

@@ -51,9 +51,13 @@ class CodexParser(BaseParser):
         session_id: Optional[str] = None
         project_path: Optional[str] = None
 
+        carryover_lines: list[dict] = []
+
         pending_content: Optional[str] = None
         pending_ts: Optional[str] = None
-        pending_response: Optional[str] = None
+        pending_response_parts: list[str] = []
+        pending_has_structured_response = False
+        pending_turn_lines: list[dict] = []
 
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -71,6 +75,19 @@ class CodexParser(BaseParser):
 
                 if project_path is None and item_type == "turn_context" and isinstance(payload, dict):
                     project_path = payload.get("cwd") or project_path
+
+                # In sessions with `event_msg` user markers, `response_item` user messages can
+                # appear *before* the corresponding `event_msg` user_message. Treat those as
+                # carryover so per-turn timelines don't accidentally include the next prompt.
+                if (
+                    has_user_events
+                    and item_type == "response_item"
+                    and isinstance(payload, dict)
+                    and payload.get("type") == "message"
+                    and payload.get("role") == "user"
+                ):
+                    carryover_lines.append(obj)
+                    continue
 
                 if has_user_events:
                     is_user_marker = (
@@ -93,7 +110,7 @@ class CodexParser(BaseParser):
                     )
 
                 if is_user_marker:
-                    if pending_content and len(pending_content.strip()) >= 10:
+                    if pending_content and pending_content.strip():
                         timestamp = self.parse_timestamp(pending_ts)
                         prompt_id = self.generate_id(
                             self.source_name,
@@ -108,30 +125,39 @@ class CodexParser(BaseParser):
                             project_path=project_path,
                             session_id=session_id,
                             timestamp=timestamp,
-                            response=pending_response,
+                            response="\n".join(pending_response_parts) if pending_response_parts else None,
+                            turn_json=json.dumps(pending_turn_lines, ensure_ascii=False)
+                            if pending_turn_lines
+                            else None,
                         )
 
-                    pending_content = str(user_message or "")
+                    pending_content = user_message if isinstance(user_message, str) else ""
                     pending_ts = obj.get("timestamp")
-                    pending_response = None
+                    pending_response_parts = []
+                    pending_has_structured_response = False
+                    pending_turn_lines = carryover_lines + [obj]
+                    carryover_lines = []
                     continue
 
                 if pending_content is None:
                     continue
+
+                pending_turn_lines.append(obj)
 
                 # Prefer structured assistant response items; fall back to event msg if needed.
                 if item_type == "response_item" and isinstance(payload, dict):
                     if payload.get("type") == "message" and payload.get("role") == "assistant":
                         text = self._extract_text_blocks(payload.get("content"), {"output_text", "text"})
                         if text:
-                            pending_response = pending_response or text
+                            pending_response_parts.append(text)
+                            pending_has_structured_response = True
                 elif item_type == "event_msg" and isinstance(payload, dict):
-                    if payload.get("type") == "agent_message":
+                    if not pending_has_structured_response and payload.get("type") == "agent_message":
                         text = payload.get("message")
                         if isinstance(text, str) and text.strip():
-                            pending_response = pending_response or text
+                            pending_response_parts.append(text)
 
-        if pending_content and len(pending_content.strip()) >= 10:
+        if pending_content and pending_content.strip():
             timestamp = self.parse_timestamp(pending_ts)
             prompt_id = self.generate_id(
                 self.source_name,
@@ -146,7 +172,8 @@ class CodexParser(BaseParser):
                 project_path=project_path,
                 session_id=session_id,
                 timestamp=timestamp,
-                response=pending_response,
+                response="\n".join(pending_response_parts) if pending_response_parts else None,
+                turn_json=json.dumps(pending_turn_lines, ensure_ascii=False) if pending_turn_lines else None,
             )
 
     def _jsonl_has_user_events(self, file_path: Path) -> bool:
@@ -192,21 +219,23 @@ class CodexParser(BaseParser):
                 continue
 
             user_content = self._extract_text_blocks(item.get("content"), {"input_text", "text"})
-            if not user_content or len(user_content.strip()) < 10:
+            if not user_content or not user_content.strip():
                 continue
 
-            response: Optional[str] = None
+            response_parts: list[str] = []
+            turn_items: list[dict] = [item]
             for next_item in items[idx + 1 :]:
                 if not isinstance(next_item, dict):
                     continue
                 if next_item.get("type") == "message" and next_item.get("role") == "user":
                     break
+                turn_items.append(next_item)
                 if next_item.get("type") == "message" and next_item.get("role") == "assistant":
-                    response = self._extract_text_blocks(
+                    response_text = self._extract_text_blocks(
                         next_item.get("content"), {"output_text", "text"}
                     )
-                    if response:
-                        break
+                    if response_text:
+                        response_parts.append(response_text)
 
             # This format lacks per-item timestamps; include the index to keep IDs stable/unique.
             unique_ts_key = f"{session_ts or ''}:{idx}"
@@ -224,7 +253,8 @@ class CodexParser(BaseParser):
                 project_path=project_path,
                 session_id=session_id,
                 timestamp=session_dt,
-                response=response,
+                response="\n".join(response_parts) if response_parts else None,
+                turn_json=json.dumps(turn_items, ensure_ascii=False),
             )
 
     def _extract_text_blocks(self, content, block_types: set[str]) -> Optional[str]:

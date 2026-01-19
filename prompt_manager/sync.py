@@ -84,6 +84,7 @@ def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path:
                 session_id=prompt.session_id,
                 timestamp=prompt.timestamp,
                 response=prompt.response,
+                turn_json=prompt.turn_json,
             )
             if inserted:
                 count += 1

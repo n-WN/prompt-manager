@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from prompt_manager.parsers.claude_code import ClaudeCodeParser
+from prompt_manager.parsers.codex import CodexParser
 from prompt_manager.parsers.cursor import CursorParser
 from prompt_manager.parsers.gemini_cli import GeminiCliParser
 
@@ -120,6 +121,87 @@ class TestClaudeCodeParser(unittest.TestCase):
             self.assertEqual(prompts[1].response, "Second response")
 
 
+class TestCodexParser(unittest.TestCase):
+    def test_parses_short_user_messages_and_preserves_turn_timeline(self) -> None:
+        parser = CodexParser(base_path=Path("/does/not/matter"))
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            lines = [
+                {
+                    "timestamp": "2026-01-19T01:45:34.000Z",
+                    "type": "session_meta",
+                    "payload": {"id": "sess", "cwd": "/proj"},
+                },
+                {
+                    "timestamp": "2026-01-19T01:45:39.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "short1"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-01-19T01:45:39.100Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "short1",
+                        "images": [],
+                        "local_images": [],
+                        "text_elements": [],
+                    },
+                },
+                {
+                    "timestamp": "2026-01-19T01:45:40.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "reply1"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-01-19T01:45:55.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "short2"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-01-19T01:45:55.100Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "short2",
+                        "images": [],
+                        "local_images": [],
+                        "text_elements": [],
+                    },
+                },
+                {
+                    "timestamp": "2026-01-19T01:45:56.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "reply2"},
+                },
+            ]
+            rollout.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+            prompts = list(parser.parse_file(rollout))
+            self.assertEqual(len(prompts), 2)
+            self.assertEqual(prompts[0].content, "short1")
+            self.assertEqual(prompts[0].response, "reply1")
+            self.assertEqual(prompts[1].content, "short2")
+            self.assertEqual(prompts[1].response, "reply2")
+
+            self.assertIsNotNone(prompts[0].turn_json)
+            self.assertIsNotNone(prompts[1].turn_json)
+            self.assertNotIn("short2", prompts[0].turn_json or "")
+            self.assertIn("short2", prompts[1].turn_json or "")
+
+
 class TestCursorStateVscdbParser(unittest.TestCase):
     def test_parses_state_vscdb_bubbles(self) -> None:
         parser = CursorParser()
@@ -192,4 +274,3 @@ class TestCursorStateVscdbParser(unittest.TestCase):
             self.assertTrue((prompt.project_path or "").startswith("cursor:"))
             self.assertEqual(prompt.content, "User prompt long enough")
             self.assertEqual(prompt.response, "Assistant reply\nMore reply")
-
