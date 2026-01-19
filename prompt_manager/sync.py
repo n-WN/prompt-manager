@@ -91,7 +91,12 @@ def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path:
         Number of new prompts inserted, or -1 on error
     """
     count = 0
+    backfill_rows: list[tuple[str, Optional[str], Optional[str]]] = []
     try:
+        # DuckDB autocommits each statement by default, which becomes extremely slow
+        # when syncing large sessions (hundreds/thousands of prompts). Wrap a file
+        # sync in a single transaction so we pay fsync/commit cost once per file.
+        conn.execute("BEGIN")
         for prompt in parser.parse_file(file_path):
             inserted = insert_prompt(
                 conn,
@@ -103,16 +108,50 @@ def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path:
                 timestamp=prompt.timestamp,
                 response=prompt.response,
                 turn_json=prompt.turn_json,
+                backfill_missing_fields=False,
             )
             if inserted:
                 count += 1
+            elif prompt.response or prompt.turn_json:
+                # Backfill missing large fields in a single set-based UPDATE (fast),
+                # instead of per-prompt UPDATEs (can be very slow in DuckDB).
+                needs_backfill = conn.execute(
+                    "SELECT response IS NULL, turn_json IS NULL FROM prompts WHERE id = ?",
+                    [prompt.id],
+                ).fetchone()
+                needs_response = bool(needs_backfill and needs_backfill[0] and prompt.response is not None)
+                needs_turn_json = bool(needs_backfill and needs_backfill[1] and prompt.turn_json is not None)
+                if needs_response or needs_turn_json:
+                    backfill_rows.append((prompt.id, prompt.response, prompt.turn_json))
+
+        if backfill_rows:
+            conn.execute("DROP TABLE IF EXISTS tmp_backfill")
+            conn.execute("CREATE TEMP TABLE tmp_backfill(id VARCHAR, response TEXT, turn_json TEXT)")
+            conn.executemany("INSERT INTO tmp_backfill VALUES (?,?,?)", backfill_rows)
+            conn.execute(
+                """
+                UPDATE prompts
+                SET response = COALESCE(prompts.response, tmp_backfill.response),
+                    turn_json = COALESCE(prompts.turn_json, tmp_backfill.turn_json),
+                    updated_at = CURRENT_TIMESTAMP
+                FROM tmp_backfill
+                WHERE prompts.id = tmp_backfill.id
+                  AND (prompts.response IS NULL OR prompts.turn_json IS NULL)
+                """
+            )
+            conn.execute("DROP TABLE tmp_backfill")
 
         # Update file state after successful parse
         stat = file_path.stat()
         _update_file_state(conn, str(file_path), parser.source_name, stat.st_size, stat.st_mtime)
+        conn.execute("COMMIT")
         return count
 
     except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         # Log error but don't crash - return -1 to indicate failure
         print(f"Error syncing {file_path}: {e}")
         return -1
@@ -186,6 +225,20 @@ def sync_all(
     for idx, (parser, file_path) in enumerate(file_jobs, 1):
         counts["files_checked"] = idx
 
+        if progress_callback:
+            progress_callback(
+                SyncProgress(
+                    phase="checking",
+                    source=parser.source_name,
+                    file_path=file_path,
+                    files_checked=idx,
+                    files_total=files_total,
+                    files_updated=counts["files_updated"],
+                    new_prompts_total=counts["total"],
+                    new_prompts_in_file=0,
+                )
+            )
+
         needs_sync = force or _file_needs_sync(conn, file_path)
         inserted_in_file = 0
         skipped = not needs_sync
@@ -204,7 +257,7 @@ def sync_all(
         if progress_callback:
             progress_callback(
                 SyncProgress(
-                    phase="syncing",
+                    phase="skipping" if skipped else "syncing",
                     source=parser.source_name,
                     file_path=file_path,
                     files_checked=idx,

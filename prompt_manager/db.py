@@ -87,6 +87,7 @@ def insert_prompt(
     timestamp: Optional[datetime] = None,
     response: Optional[str] = None,
     turn_json: Optional[str] = None,
+    backfill_missing_fields: bool = True,
 ) -> bool:
     """Insert a prompt if it doesn't exist.
 
@@ -108,19 +109,88 @@ def insert_prompt(
 
     # Existing prompt: opportunistically fill in missing fields without
     # counting it as a "new prompt" for sync stats.
-    if response or turn_json:
-        conn.execute(
-            """
-            UPDATE prompts
-            SET response = COALESCE(response, ?),
-                turn_json = COALESCE(turn_json, ?),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            [response, turn_json, id],
-        )
+    if backfill_missing_fields and (response or turn_json):
+        # NOTE: Updating large TEXT columns can be expensive in DuckDB even when
+        # the values don't change. Only backfill when the stored value is NULL.
+        needs_backfill = conn.execute(
+            "SELECT response IS NULL, turn_json IS NULL FROM prompts WHERE id = ?",
+            [id],
+        ).fetchone()
+
+        needs_response = bool(needs_backfill and needs_backfill[0] and response is not None)
+        needs_turn_json = bool(needs_backfill and needs_backfill[1] and turn_json is not None)
+
+        if needs_response or needs_turn_json:
+            conn.execute(
+                """
+                UPDATE prompts
+                SET response = COALESCE(response, ?),
+                    turn_json = COALESCE(turn_json, ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [response, turn_json, id],
+            )
 
     return False
+
+
+def search_prompt_summaries(
+    conn: duckdb.DuckDBPyConnection,
+    query: Optional[str] = None,
+    source: Optional[str] = None,
+    starred_only: bool = False,
+    limit: int = 1000,
+    offset: int = 0,
+    snippet_len: int = 400,
+) -> list[dict]:
+    """Search prompt rows for list views (returns truncated content, no response).
+
+    This avoids loading potentially huge prompt/response bodies just to populate the
+    tree/list UI. Use `get_prompt()` to fetch full content for a selected row.
+    """
+    conditions = []
+    params = []
+
+    if query:
+        conditions.append("content ILIKE ?")
+        params.append(f"%{query}%")
+
+    if source:
+        conditions.append("source = ?")
+        params.append(source)
+
+    if starred_only:
+        conditions.append("starred = TRUE")
+
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+    result = conn.execute(
+        f"""
+        SELECT id, source, project_path, session_id,
+               SUBSTR(content, 1, ?) AS content,
+               timestamp, tags, starred, use_count, created_at
+        FROM prompts
+        WHERE {where_clause}
+        ORDER BY timestamp DESC NULLS LAST
+        LIMIT ? OFFSET ?
+        """,
+        [int(snippet_len)] + params + [limit, offset],
+    ).fetchall()
+
+    columns = [
+        "id",
+        "source",
+        "project_path",
+        "session_id",
+        "content",
+        "timestamp",
+        "tags",
+        "starred",
+        "use_count",
+        "created_at",
+    ]
+    return [dict(zip(columns, row)) for row in result]
 
 
 def search_prompts(

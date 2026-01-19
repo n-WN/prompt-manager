@@ -15,12 +15,22 @@ from textual.screen import ModalScreen
 from datetime import datetime
 from typing import Optional
 from collections import defaultdict
+import platform
 import pyperclip
+import shlex
+import shutil
 import subprocess
 import os
 import threading
 
-from .db import get_connection, search_prompts, toggle_star, increment_use_count, get_stats, get_prompt
+from .db import (
+    get_connection,
+    get_prompt,
+    get_stats,
+    increment_use_count,
+    search_prompt_summaries,
+    toggle_star,
+)
 from .codex_transcript import format_codex_turn_json
 from .sync import SyncProgress, rebuild_database, sync_all
 
@@ -51,14 +61,18 @@ class ForkConfirmScreen(ModalScreen):
                 cmd = "claude"
                 desc = "Launch Claude Code CLI"
         elif source == "codex":
-            cmd = "codex"
-            desc = "Launch Codex CLI (new session)"
+            if session_id and session_id != "N/A":
+                cmd = f"codex fork {session_id}"
+                desc = "Fork a new Codex session from saved history"
+            else:
+                cmd = "codex"
+                desc = "Launch Codex CLI (new session)"
         elif source == "aider":
             cmd = "aider"
             desc = "Launch Aider (new chat in project directory)"
         elif source == "cursor":
             cmd = "cursor ."
-            desc = "Open Cursor IDE"
+            desc = "Open Cursor IDE in project directory"
         elif source == "gemini_cli":
             cmd = "gemini"
             desc = "Launch Gemini CLI (new session)"
@@ -672,7 +686,7 @@ class PromptManagerApp(App):
 
     def load_prompts(self) -> None:
         """Load prompts and build tree by session."""
-        self.prompts = search_prompts(
+        self.prompts = search_prompt_summaries(
             self.conn,
             query=self.search_query if self.search_query else None,
             source=self.current_filter,
@@ -1063,10 +1077,21 @@ class PromptManagerApp(App):
     @on(Tree.NodeSelected, "#prompt-tree")
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         node = event.node
-        if node.data and node.data in self.prompt_map:
-            self.update_preview(self.prompt_map[node.data])
-        else:
+        if not node.data or node.data not in self.prompt_map:
             self.update_preview(None)
+            return
+
+        prompt_id = node.data
+        cached = self.prompt_map[prompt_id]
+
+        # Summaries intentionally omit `response`. Load full prompt lazily on select.
+        if "response" not in cached:
+            full = get_prompt(self.conn, prompt_id)
+            if full:
+                self.prompt_map[prompt_id] = full
+                cached = full
+
+        self.update_preview(cached)
 
     @on(Button.Pressed, "#btn-all")
     def on_all(self) -> None:
@@ -1144,16 +1169,16 @@ class PromptManagerApp(App):
             else:
                 cmd = ["claude"]
         elif source == "codex":
-            # Codex: simple launch (no fork support known)
+            # Codex: fork the saved session (Codex CLI supports `codex fork <SESSION_ID>`)
             work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
-            cmd = ["codex"]
+            cmd = ["codex", "fork", session_id] if session_id else ["codex"]
         elif source == "aider":
             # Aider: launch in project directory if available
             work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
             cmd = ["aider"]
         elif source == "cursor":
-            # Cursor: open in project directory
-            work_dir = os.path.expanduser("~")
+            # Cursor: open in project directory when available
+            work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
             cmd = ["cursor", "."]
         elif source == "gemini_cli":
             # Gemini CLI: start a new session (no reliable resume command inferred)
@@ -1167,46 +1192,99 @@ class PromptManagerApp(App):
         if not os.path.isdir(work_dir):
             work_dir = os.path.expanduser("~")
 
+        pretty_cmd = f"cd {shlex.quote(work_dir)} && " + " ".join(
+            shlex.quote(str(part)) for part in cmd
+        )
+
         try:
             # Launch in new terminal
             self._launch_in_terminal(cmd, work_dir)
             if source == "claude_code" and session_id:
                 self.notify(f"Forking session {session_id[:8]}... in {work_dir}")
+            elif source == "codex" and session_id:
+                self.notify(f"Forking Codex session {session_id[:8]}... in {work_dir}")
             else:
                 self.notify(f"Launching {source} in {work_dir}")
         except Exception as e:
-            self.notify(f"Launch failed: {e}", severity="error")
+            try:
+                pyperclip.copy(pretty_cmd)
+                self.notify(
+                    f"Launch failed: {e} (command copied to clipboard)",
+                    severity="error",
+                )
+            except Exception:
+                self.notify(f"Launch failed: {e} (run: {pretty_cmd})", severity="error")
 
     def _launch_in_terminal(self, cmd: list, work_dir: str) -> None:
         """Launch command in a new terminal window."""
-        import platform
 
-        if platform.system() == "Darwin":
-            # macOS - use osascript to open Terminal
-            script = f'''
-            tell application "Terminal"
-                activate
-                do script "cd '{work_dir}' && {' '.join(cmd)}"
-            end tell
-            '''
+        def shell_join(argv: list[str]) -> str:
+            return " ".join(shlex.quote(str(part)) for part in argv)
+
+        def applescript_string(text: str) -> str:
+            return text.replace("\\", "\\\\").replace('"', '\\"')
+
+        shell_cmd = f"cd {shlex.quote(work_dir)} && {shell_join(cmd)}"
+
+        # If we're inside tmux, prefer opening a new tmux window/tab.
+        if os.environ.get("TMUX") and shutil.which("tmux"):
+            subprocess.Popen(["tmux", "new-window", "-c", work_dir, shell_cmd])
+            return
+
+        system = platform.system()
+        if system == "Darwin":
+            term_program = os.environ.get("TERM_PROGRAM", "")
+            if term_program == "iTerm.app":
+                script = f'''
+                tell application "iTerm"
+                    activate
+                    create window with default profile
+                    tell current session of current window
+                        write text "{applescript_string(shell_cmd)}"
+                    end tell
+                end tell
+                '''
+            else:
+                script = f'''
+                tell application "Terminal"
+                    activate
+                    do script "{applescript_string(shell_cmd)}"
+                end tell
+                '''
             subprocess.Popen(["osascript", "-e", script])
-        elif platform.system() == "Linux":
-            # Linux - try common terminals
-            terminals = [
-                ["gnome-terminal", "--", "bash", "-c", f"cd '{work_dir}' && {' '.join(cmd)}; exec bash"],
-                ["xterm", "-e", f"cd '{work_dir}' && {' '.join(cmd)}; bash"],
-                ["konsole", "-e", f"cd '{work_dir}' && {' '.join(cmd)}"],
+            return
+
+        if system == "Linux":
+            # Prefer modern terminals that support passing argv directly when available.
+            direct = [
+                ("wezterm", ["wezterm", "start", "--cwd", work_dir, "--", *cmd]),
+                ("kitty", ["kitty", "--directory", work_dir, *cmd]),
+                ("alacritty", ["alacritty", "--working-directory", work_dir, "-e", *cmd]),
             ]
-            for term_cmd in terminals:
-                try:
+            for exe, term_cmd in direct:
+                if shutil.which(exe):
                     subprocess.Popen(term_cmd)
                     return
-                except FileNotFoundError:
-                    continue
+
+            # Fallback to terminals that require a shell string.
+            bash_cmd = f"{shell_cmd}; exec bash"
+            candidates = [
+                ("x-terminal-emulator", ["x-terminal-emulator", "-e", "bash", "-lc", bash_cmd]),
+                ("gnome-terminal", ["gnome-terminal", "--", "bash", "-lc", bash_cmd]),
+                ("konsole", ["konsole", "-e", "bash", "-lc", bash_cmd]),
+                ("xterm", ["xterm", "-e", "bash", "-lc", bash_cmd]),
+            ]
+            for exe, term_cmd in candidates:
+                if shutil.which(exe):
+                    subprocess.Popen(term_cmd)
+                    return
             raise RuntimeError("No supported terminal found")
-        else:
-            # Windows or other
-            subprocess.Popen(cmd, cwd=work_dir, shell=True)
+
+        # Windows or other: best-effort, run detached in a new process group.
+        try:
+            subprocess.Popen(cmd, cwd=work_dir, start_new_session=True)
+        except TypeError:
+            subprocess.Popen(cmd, cwd=work_dir)
 
 
 def main():
