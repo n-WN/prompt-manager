@@ -1,10 +1,11 @@
 """Sync prompts from all sources to the database with incremental updates."""
 
+from __future__ import annotations
+
 import duckdb
-import os
 from pathlib import Path
-from typing import Optional
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 from .db import get_connection, insert_prompt
 from .parsers.claude_code import ClaudeCodeParser
@@ -12,6 +13,23 @@ from .parsers.cursor import CursorParser
 from .parsers.aider import AiderParser
 from .parsers.codex import CodexParser
 from .parsers.gemini_cli import GeminiCliParser
+
+
+@dataclass(frozen=True)
+class SyncProgress:
+    phase: str
+    source: str
+    file_path: Path
+    files_checked: int
+    files_total: int
+    files_updated: int
+    new_prompts_total: int
+    new_prompts_in_file: int
+    skipped: bool = False
+    error: Optional[str] = None
+
+
+ProgressCallback = Callable[[SyncProgress], None]
 
 
 def _init_file_state_table(conn: duckdb.DuckDBPyConnection) -> None:
@@ -100,12 +118,19 @@ def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path:
         return -1
 
 
-def sync_all(conn: Optional[duckdb.DuckDBPyConnection] = None, force: bool = False) -> dict:
+def sync_all(
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+    force: bool = False,
+    progress_callback: Optional[ProgressCallback] = None,
+    parsers: Optional[list["BaseParser"]] = None,
+) -> dict:
     """Sync prompts from all sources.
 
     Args:
         conn: Database connection
         force: If True, re-sync all files regardless of state
+        progress_callback: Optional callback invoked after each file is processed
+        parsers: Optional parser instances (primarily for tests)
 
     Returns:
         Dict with counts per source and files_checked/files_updated stats
@@ -126,7 +151,7 @@ def sync_all(conn: Optional[duckdb.DuckDBPyConnection] = None, force: bool = Fal
         "files_updated": 0,
     }
 
-    parsers = [
+    active_parsers = parsers or [
         ClaudeCodeParser(),
         CursorParser(),
         AiderParser(),
@@ -134,25 +159,148 @@ def sync_all(conn: Optional[duckdb.DuckDBPyConnection] = None, force: bool = Fal
         GeminiCliParser(),
     ]
 
-    for parser in parsers:
-        source_count = 0
+    # Ensure all sources exist in the counts dict even when custom parsers are provided.
+    for parser in active_parsers:
+        counts.setdefault(parser.source_name, 0)
 
+    file_jobs: list[tuple["BaseParser", Path]] = []
+    for parser in active_parsers:
         for file_path in parser.find_log_files():
-            counts["files_checked"] += 1
+            file_jobs.append((parser, file_path))
 
-            # Skip unchanged files unless forced
-            if not force and not _file_needs_sync(conn, file_path):
-                continue
+    files_total = len(file_jobs)
+    if progress_callback:
+        progress_callback(
+            SyncProgress(
+                phase="starting",
+                source="",
+                file_path=Path(),
+                files_checked=0,
+                files_total=files_total,
+                files_updated=0,
+                new_prompts_total=0,
+                new_prompts_in_file=0,
+            )
+        )
 
+    for idx, (parser, file_path) in enumerate(file_jobs, 1):
+        counts["files_checked"] = idx
+
+        needs_sync = force or _file_needs_sync(conn, file_path)
+        inserted_in_file = 0
+        skipped = not needs_sync
+        error: Optional[str] = None
+
+        if needs_sync:
             counts["files_updated"] += 1
-
-            # Parse and insert prompts from this file
             result = _sync_file(conn, parser, file_path)
             if result >= 0:
-                source_count += result
+                inserted_in_file = result
+                counts[parser.source_name] = counts.get(parser.source_name, 0) + result
+                counts["total"] += result
+            else:
+                error = "sync failed"
 
-        counts[parser.source_name] = source_count
-        counts["total"] += source_count
+        if progress_callback:
+            progress_callback(
+                SyncProgress(
+                    phase="syncing",
+                    source=parser.source_name,
+                    file_path=file_path,
+                    files_checked=idx,
+                    files_total=files_total,
+                    files_updated=counts["files_updated"],
+                    new_prompts_total=counts["total"],
+                    new_prompts_in_file=inserted_in_file,
+                    skipped=skipped,
+                    error=error,
+                )
+            )
+
+    return counts
+
+
+def rebuild_database(
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+    preserve_metadata: bool = True,
+) -> dict:
+    """Rebuild the prompt database by re-parsing all known log files.
+
+    Notes:
+      - This clears the `prompts` table then runs a forced sync of all files.
+      - When `preserve_metadata` is true, starred/tags/use_count are restored by prompt id.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    _init_file_state_table(conn)
+
+    preserved: list[tuple[str, bool, object, int]] = []
+    if preserve_metadata:
+        try:
+            preserved = conn.execute(
+                "SELECT id, starred, tags, use_count FROM prompts"
+            ).fetchall()
+        except Exception:
+            preserved = []
+
+    if progress_callback:
+        progress_callback(
+            SyncProgress(
+                phase="resetting",
+                source="",
+                file_path=Path(),
+                files_checked=0,
+                files_total=0,
+                files_updated=0,
+                new_prompts_total=0,
+                new_prompts_in_file=0,
+            )
+        )
+
+    conn.execute("DELETE FROM prompts")
+    try:
+        conn.execute("DELETE FROM file_sync_state")
+    except Exception:
+        pass
+    try:
+        conn.execute("DELETE FROM sync_state")
+    except Exception:
+        pass
+
+    counts = sync_all(conn, force=True, progress_callback=progress_callback)
+
+    if preserve_metadata and preserved:
+        if progress_callback:
+            progress_callback(
+                SyncProgress(
+                    phase="restoring",
+                    source="",
+                    file_path=Path(),
+                    files_checked=counts.get("files_checked", 0),
+                    files_total=counts.get("files_checked", 0),
+                    files_updated=counts.get("files_updated", 0),
+                    new_prompts_total=counts.get("total", 0),
+                    new_prompts_in_file=0,
+                )
+            )
+
+        for prompt_id, starred, tags, use_count in preserved:
+            try:
+                conn.execute(
+                    """
+                    UPDATE prompts
+                    SET starred = ?,
+                        tags = ?,
+                        use_count = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    [bool(starred), tags, int(use_count or 0), prompt_id],
+                )
+            except Exception:
+                continue
 
     return counts
 
