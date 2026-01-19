@@ -1231,9 +1231,9 @@ class PromptManagerApp(App):
         session_id = self.selected_prompt.get("session_id") or ""
 
         def resolve_work_dir(project_path: str) -> str:
-            if project_path.startswith("cursor:"):
-                candidate = project_path.split(":", 1)[1]
-                if os.path.isdir(candidate):
+            if ":" in project_path:
+                _, candidate = project_path.split(":", 1)
+                if candidate and os.path.isdir(candidate):
                     return candidate
             return project_path if os.path.isdir(project_path) else os.path.expanduser("~")
 

@@ -105,8 +105,11 @@ def main():
                 line = p.phase
             else:
                 suffix = ""
-                if p.file_items_done:
-                    suffix = f" | items={p.file_items_done}"
+                if p.phase == "syncing":
+                    if p.file_items_total is not None:
+                        suffix = f" | items={p.file_items_done}/{p.file_items_total}"
+                    else:
+                        suffix = f" | items={p.file_items_done}"
                 if p.skipped and p.skip_reason:
                     suffix += f" | skipped={p.skip_reason}"
                 line = f"{p.phase} {p.files_checked}/{p.files_total} | updated={p.files_updated} | new={p.new_prompts_total}{suffix}"

@@ -5,8 +5,9 @@ from __future__ import annotations
 import duckdb
 from pathlib import Path
 from dataclasses import dataclass
+import logging
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, TYPE_CHECKING
 
 from .db import get_connection, insert_prompt
 from .parsers.claude_code import ClaudeCodeParser
@@ -14,6 +15,9 @@ from .parsers.cursor import CursorParser
 from .parsers.aider import AiderParser
 from .parsers.codex import CodexParser
 from .parsers.gemini_cli import GeminiCliParser
+
+if TYPE_CHECKING:
+    from .parsers import BaseParser
 
 
 @dataclass(frozen=True)
@@ -50,13 +54,15 @@ def _init_file_state_table(conn: duckdb.DuckDBPyConnection) -> None:
     """)
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info('file_sync_state')").fetchall()}
-    except Exception:
+    except Exception as e:
+        logging.debug("Could not inspect file_sync_state columns: %s", e)
         return
 
     if "sync_version" not in columns:
         try:
             conn.execute("ALTER TABLE file_sync_state ADD COLUMN sync_version INTEGER DEFAULT 1")
-        except Exception:
+        except Exception as e:
+            logging.debug("Could not add sync_version column: %s", e)
             return
 
     conn.execute("UPDATE file_sync_state SET sync_version = 1 WHERE sync_version IS NULL")
@@ -95,7 +101,7 @@ def _update_file_state(
 
 
 def _file_sync_status(
-    conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path: Path
+    conn: duckdb.DuckDBPyConnection, parser: BaseParser, file_path: Path
 ) -> tuple[bool, Optional[str]]:
     """Return (needs_sync, reason) for a file."""
     try:
@@ -120,14 +126,14 @@ def _file_sync_status(
     return False, "up-to-date"
 
 
-def _file_needs_sync(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path: Path) -> bool:
+def _file_needs_sync(conn: duckdb.DuckDBPyConnection, parser: BaseParser, file_path: Path) -> bool:
     needs_sync, _ = _file_sync_status(conn, parser, file_path)
     return needs_sync
 
 
 def _sync_file(
     conn: duckdb.DuckDBPyConnection,
-    parser: "BaseParser",
+    parser: BaseParser,
     file_path: Path,
     *,
     progress: Optional[Callable[[int, int], None]] = None,
@@ -310,6 +316,7 @@ def sync_all(
             )
 
         inserted_in_file = 0
+        file_items_done = 0
         skipped = not needs_sync
         error: Optional[str] = None
 
@@ -346,6 +353,8 @@ def sync_all(
                 _file_path: Path = current_file_path,
                 _idx: int = current_idx,
             ) -> None:
+                nonlocal file_items_done
+                file_items_done = items_done
                 if progress is None:
                     return
                 progress(
@@ -382,6 +391,7 @@ def sync_all(
                     files_updated=counts["files_updated"],
                     new_prompts_total=counts["total"],
                     new_prompts_in_file=inserted_in_file,
+                    file_items_done=file_items_done,
                     skipped=skipped,
                     skip_reason=reason,
                     error=error,
