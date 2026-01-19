@@ -24,6 +24,7 @@ class RolloutLine:
     timestamp: str
     item: "RolloutItem"
     raw: JsonDict
+    raw_line: Optional[str] = None
 
     @classmethod
     def from_json_line(cls, line: str) -> Optional["RolloutLine"]:
@@ -36,10 +37,10 @@ class RolloutLine:
             return None
         if not isinstance(raw, dict):
             return None
-        return cls.from_dict(raw)
+        return cls.from_dict(raw, raw_line=line)
 
     @classmethod
-    def from_dict(cls, raw: JsonDict) -> Optional["RolloutLine"]:
+    def from_dict(cls, raw: JsonDict, *, raw_line: Optional[str] = None) -> Optional["RolloutLine"]:
         timestamp = raw.get("timestamp")
         item_type = raw.get("type")
         payload = raw.get("payload")
@@ -48,7 +49,7 @@ class RolloutLine:
             return None
 
         item = RolloutItem.parse(item_type, payload)
-        return cls(timestamp=timestamp, item=item, raw=raw)
+        return cls(timestamp=timestamp, item=item, raw=raw, raw_line=raw_line)
 
 
 def iter_rollout_lines(path) -> Iterator[RolloutLine]:
@@ -274,4 +275,3 @@ class EventMsgItem(RolloutItem):
 class UnknownRolloutItem(RolloutItem):
     item_type: str
     raw: Any
-

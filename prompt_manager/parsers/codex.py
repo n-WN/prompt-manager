@@ -61,17 +61,17 @@ class CodexParser(BaseParser):
         session_id: Optional[str] = None
         project_path: Optional[str] = None
 
-        carryover_lines: list[dict] = []
+        carryover_lines: list[str] = []
 
         pending_content: Optional[str] = None
         pending_ts: Optional[str] = None
         pending_response_parts: list[str] = []
         pending_has_structured_response = False
-        pending_turn_lines: list[dict] = []
+        pending_turn_lines: list[str] = []
 
         for line in iter_rollout_lines(file_path):
             item = line.item
-            raw = line.raw
+            raw_line = line.raw_line or json.dumps(line.raw, ensure_ascii=False)
 
             if session_id is None and isinstance(item, SessionMetaItem):
                 session_id = item.payload.id or None
@@ -87,7 +87,7 @@ class CodexParser(BaseParser):
             # appear *before* the corresponding `event_msg` user_message. Treat those as
             # carryover so per-turn timelines don't accidentally include the next prompt.
             if has_user_events and isinstance(item, ResponseItemItem) and item.message and item.message.role == "user":
-                carryover_lines.append(raw)
+                carryover_lines.append(raw_line)
                 continue
 
             if has_user_events:
@@ -118,21 +118,21 @@ class CodexParser(BaseParser):
                         session_id=session_id,
                         timestamp=timestamp,
                         response="\n".join(pending_response_parts) if pending_response_parts else None,
-                        turn_json=json.dumps(pending_turn_lines, ensure_ascii=False) if pending_turn_lines else None,
+                        turn_json=f"[{','.join(pending_turn_lines)}]" if pending_turn_lines else None,
                     )
 
                 pending_content = user_message if isinstance(user_message, str) else ""
                 pending_ts = line.timestamp
                 pending_response_parts = []
                 pending_has_structured_response = False
-                pending_turn_lines = carryover_lines + [raw]
+                pending_turn_lines = carryover_lines + [raw_line]
                 carryover_lines = []
                 continue
 
             if pending_content is None:
                 continue
 
-            pending_turn_lines.append(raw)
+            pending_turn_lines.append(raw_line)
 
             # Prefer structured assistant response items; fall back to event msg if needed.
             if isinstance(item, ResponseItemItem) and item.message and item.message.role == "assistant":
@@ -164,7 +164,7 @@ class CodexParser(BaseParser):
                 session_id=session_id,
                 timestamp=timestamp,
                 response="\n".join(pending_response_parts) if pending_response_parts else None,
-                turn_json=json.dumps(pending_turn_lines, ensure_ascii=False) if pending_turn_lines else None,
+                turn_json=f"[{','.join(pending_turn_lines)}]" if pending_turn_lines else None,
             )
 
     def _jsonl_has_user_events(self, file_path: Path) -> bool:

@@ -147,6 +147,43 @@ def _sync_file(
     items_done = 0
     last_emit = 0.0
     backfill_rows: list[tuple[str, Optional[str], Optional[str]]] = []
+    backfill_batch_size = 250
+
+    try:
+        file_size = file_path.stat().st_size
+    except OSError:
+        file_size = 0
+
+    batch_row_limit = 1000
+    batch_byte_limit = 64 * 1024 * 1024
+    if parser.source_name == "codex" or file_size >= 20 * 1024 * 1024:
+        batch_row_limit = 200
+        batch_byte_limit = 16 * 1024 * 1024
+
+    batch_rows = 0
+    batch_bytes = 0
+
+    def flush_backfill_rows() -> None:
+        nonlocal backfill_rows
+        if not backfill_rows:
+            return
+        conn.execute("DROP TABLE IF EXISTS tmp_backfill")
+        conn.execute("CREATE TEMP TABLE tmp_backfill(id VARCHAR, response TEXT, turn_json TEXT)")
+        conn.executemany("INSERT INTO tmp_backfill VALUES (?,?,?)", backfill_rows)
+        conn.execute(
+            """
+            UPDATE prompts
+            SET response = COALESCE(prompts.response, tmp_backfill.response),
+                turn_json = COALESCE(prompts.turn_json, tmp_backfill.turn_json),
+                updated_at = CURRENT_TIMESTAMP
+            FROM tmp_backfill
+            WHERE prompts.id = tmp_backfill.id
+              AND (prompts.response IS NULL OR prompts.turn_json IS NULL)
+            """
+        )
+        conn.execute("DROP TABLE tmp_backfill")
+        backfill_rows = []
+
     try:
         # DuckDB autocommits each statement by default, which becomes extremely slow
         # when syncing large sessions (hundreds/thousands of prompts). Wrap a file
@@ -154,6 +191,15 @@ def _sync_file(
         conn.execute("BEGIN")
         for prompt in parser.parse_file(file_path):
             items_done += 1
+            batch_rows += 1
+
+            approx = len(prompt.content)
+            if prompt.response:
+                approx += len(prompt.response)
+            if prompt.turn_json:
+                approx += len(prompt.turn_json)
+            batch_bytes += approx
+
             inserted = insert_prompt(
                 conn,
                 id=prompt.id,
@@ -180,28 +226,23 @@ def _sync_file(
                 if needs_response or needs_turn_json:
                     backfill_rows.append((prompt.id, prompt.response, prompt.turn_json))
 
+            if len(backfill_rows) >= backfill_batch_size:
+                flush_backfill_rows()
+
+            if batch_rows >= batch_row_limit or batch_bytes >= batch_byte_limit:
+                flush_backfill_rows()
+                conn.execute("COMMIT")
+                conn.execute("BEGIN")
+                batch_rows = 0
+                batch_bytes = 0
+
             if progress:
                 now = time.monotonic()
                 if items_done == 1 or (now - last_emit) > 0.2:
                     progress(items_done, count)
                     last_emit = now
 
-        if backfill_rows:
-            conn.execute("DROP TABLE IF EXISTS tmp_backfill")
-            conn.execute("CREATE TEMP TABLE tmp_backfill(id VARCHAR, response TEXT, turn_json TEXT)")
-            conn.executemany("INSERT INTO tmp_backfill VALUES (?,?,?)", backfill_rows)
-            conn.execute(
-                """
-                UPDATE prompts
-                SET response = COALESCE(prompts.response, tmp_backfill.response),
-                    turn_json = COALESCE(prompts.turn_json, tmp_backfill.turn_json),
-                    updated_at = CURRENT_TIMESTAMP
-                FROM tmp_backfill
-                WHERE prompts.id = tmp_backfill.id
-                  AND (prompts.response IS NULL OR prompts.turn_json IS NULL)
-                """
-            )
-            conn.execute("DROP TABLE tmp_backfill")
+        flush_backfill_rows()
 
         # Update file state after successful parse
         stat = file_path.stat()
@@ -419,14 +460,19 @@ def rebuild_database(
 
     _init_file_state_table(conn)
 
-    preserved: list[tuple[str, bool, object, int]] = []
+    preserved_table = "pm_preserved_prompt_metadata"
     if preserve_metadata:
         try:
-            preserved = conn.execute(
-                "SELECT id, starred, tags, use_count FROM prompts"
-            ).fetchall()
+            conn.execute(f"DROP TABLE IF EXISTS {preserved_table}")
+            conn.execute(
+                f"""
+                CREATE TABLE {preserved_table} AS
+                SELECT id, starred, tags, use_count
+                FROM prompts
+                """
+            )
         except Exception:
-            preserved = []
+            preserve_metadata = False
 
     if progress_callback:
         progress_callback(
@@ -454,7 +500,7 @@ def rebuild_database(
 
     counts = sync_all(conn, force=True, progress_callback=progress_callback)
 
-    if preserve_metadata and preserved:
+    if preserve_metadata:
         if progress_callback:
             progress_callback(
                 SyncProgress(
@@ -469,21 +515,23 @@ def rebuild_database(
                 )
             )
 
-        for prompt_id, starred, tags, use_count in preserved:
+        try:
+            conn.execute(
+                f"""
+                UPDATE prompts
+                SET starred = {preserved_table}.starred,
+                    tags = {preserved_table}.tags,
+                    use_count = {preserved_table}.use_count,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM {preserved_table}
+                WHERE prompts.id = {preserved_table}.id
+                """
+            )
+        finally:
             try:
-                conn.execute(
-                    """
-                    UPDATE prompts
-                    SET starred = ?,
-                        tags = ?,
-                        use_count = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    [bool(starred), tags, int(use_count or 0), prompt_id],
-                )
+                conn.execute(f"DROP TABLE IF EXISTS {preserved_table}")
             except Exception:
-                continue
+                pass
 
     return counts
 

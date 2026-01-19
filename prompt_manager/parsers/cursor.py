@@ -243,7 +243,7 @@ class CursorParser(BaseParser):
             if "cursorDiskKV" not in tables:
                 return
 
-            composers: Dict[str, Dict[str, Any]] = {}
+            composer_meta: Dict[str, Dict[str, Any]] = {}
             for key, value in conn.execute(
                 "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
             ):
@@ -252,101 +252,122 @@ class CursorParser(BaseParser):
                     continue
                 obj = self._decode_kv_json(value)
                 if isinstance(obj, dict):
-                    composers[composer_id] = obj
+                    composer_meta[composer_id] = {
+                        "createdAt": obj.get("createdAt"),
+                        "project_path": self._infer_project_path(obj),
+                    }
 
-            bubbles_by_composer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            current_composer_id: Optional[str] = None
+            current_bubbles: list[dict[str, Any]] = []
+
+            def flush_composer() -> Iterator[ParsedPrompt]:
+                if current_composer_id is None or not current_bubbles:
+                    return iter(())
+                meta = composer_meta.get(current_composer_id, {})
+                return self._iter_state_vscdb_composer_prompts(
+                    current_composer_id,
+                    current_bubbles,
+                    composer_created_at=meta.get("createdAt"),
+                    composer_project_path=meta.get("project_path"),
+                )
+
             for key, value in conn.execute(
-                "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
+                "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' ORDER BY key"
             ):
                 composer_id, bubble_id = self._parse_bubble_key(key)
                 if not composer_id or not bubble_id:
                     continue
 
+                if current_composer_id is None:
+                    current_composer_id = composer_id
+
+                if composer_id != current_composer_id:
+                    yield from flush_composer()
+                    current_composer_id = composer_id
+                    current_bubbles = []
+
                 obj = self._decode_kv_json(value)
                 if not isinstance(obj, dict):
                     continue
 
-                # Normalize bubble id
                 if not obj.get("bubbleId"):
                     obj["bubbleId"] = bubble_id
-                obj["_composerId"] = composer_id
 
-                bubbles_by_composer[composer_id].append(obj)
+                trimmed = {k: obj.get(k) for k in ("bubbleId", "type", "text", "createdAt", "timingInfo") if k in obj}
+                current_bubbles.append(trimmed)
 
-            for composer_id, bubbles in bubbles_by_composer.items():
-                composer = composers.get(composer_id, {})
-
-                project_path = self._infer_project_path(composer)
-                if project_path:
-                    project_label = f"cursor:{project_path}"
-                else:
-                    project_label = "cursor"
-
-                # Sort bubbles by a stable numeric time key
-                prepared: list[tuple[float, dict[str, Any]]] = []
-                for bubble in bubbles:
-                    sort_key = self._bubble_sort_key(bubble)
-                    prepared.append((sort_key, bubble))
-                prepared.sort(key=lambda x: (x[0], str(x[1].get("bubbleId", ""))))
-
-                # Create prompts by pairing user bubbles (type=1) with subsequent assistant bubbles (type=2)
-                idx = 0
-                while idx < len(prepared):
-                    _, bubble = prepared[idx]
-                    if bubble.get("type") != 1:
-                        idx += 1
-                        continue
-
-                    content = bubble.get("text") or ""
-                    if not isinstance(content, str):
-                        idx += 1
-                        continue
-
-                    content = self._clean_user_content(content)
-                    if len(content.strip()) < 10:
-                        idx += 1
-                        continue
-
-                    timestamp = self._bubble_timestamp(bubble) or self.parse_timestamp(
-                        composer.get("createdAt")
-                    )
-
-                    response_parts: list[str] = []
-                    j = idx + 1
-                    while j < len(prepared):
-                        _, next_bubble = prepared[j]
-                        if next_bubble.get("type") == 1:
-                            break
-                        if next_bubble.get("type") == 2:
-                            text = next_bubble.get("text") or ""
-                            if isinstance(text, str) and text.strip():
-                                response_parts.append(text)
-                        j += 1
-
-                    response = "\n".join(response_parts) if response_parts else None
-
-                    bubble_id = str(bubble.get("bubbleId") or "")
-                    prompt_id = self.generate_id(
-                        self.source_name,
-                        content,
-                        composer_id,
-                        bubble_id,
-                    )
-
-                    yield ParsedPrompt(
-                        id=prompt_id,
-                        source=self.source_name,
-                        content=content,
-                        project_path=project_label,
-                        session_id=composer_id,
-                        timestamp=timestamp,
-                        response=response,
-                    )
-
-                    idx += 1
+            yield from flush_composer()
 
         finally:
             conn.close()
+
+    def _iter_state_vscdb_composer_prompts(
+        self,
+        composer_id: str,
+        bubbles: list[dict[str, Any]],
+        *,
+        composer_created_at: Optional[str],
+        composer_project_path: Optional[str],
+    ) -> Iterator[ParsedPrompt]:
+        project_label = f"cursor:{composer_project_path}" if composer_project_path else "cursor"
+
+        prepared: list[tuple[float, dict[str, Any]]] = []
+        for bubble in bubbles:
+            prepared.append((self._bubble_sort_key(bubble), bubble))
+        prepared.sort(key=lambda x: (x[0], str(x[1].get("bubbleId", ""))))
+
+        idx = 0
+        while idx < len(prepared):
+            _, bubble = prepared[idx]
+            if bubble.get("type") != 1:
+                idx += 1
+                continue
+
+            content = bubble.get("text") or ""
+            if not isinstance(content, str):
+                idx += 1
+                continue
+
+            content = self._clean_user_content(content)
+            if len(content.strip()) < 10:
+                idx += 1
+                continue
+
+            timestamp = self._bubble_timestamp(bubble) or self.parse_timestamp(composer_created_at)
+
+            response_parts: list[str] = []
+            j = idx + 1
+            while j < len(prepared):
+                _, next_bubble = prepared[j]
+                if next_bubble.get("type") == 1:
+                    break
+                if next_bubble.get("type") == 2:
+                    text = next_bubble.get("text") or ""
+                    if isinstance(text, str) and text.strip():
+                        response_parts.append(text)
+                j += 1
+
+            response = "\n".join(response_parts) if response_parts else None
+
+            bubble_id = str(bubble.get("bubbleId") or "")
+            prompt_id = self.generate_id(
+                self.source_name,
+                content,
+                composer_id,
+                bubble_id,
+            )
+
+            yield ParsedPrompt(
+                id=prompt_id,
+                source=self.source_name,
+                content=content,
+                project_path=project_label,
+                session_id=composer_id,
+                timestamp=timestamp,
+                response=response,
+            )
+
+            idx += 1
 
     def _parse_composer_id(self, key: str) -> Optional[str]:
         if not isinstance(key, str):
