@@ -20,6 +20,7 @@ import subprocess
 import os
 
 from .db import get_connection, search_prompts, toggle_star, increment_use_count, get_stats, get_prompt
+from .codex_transcript import format_codex_turn_json
 from .sync import sync_all
 
 
@@ -215,6 +216,12 @@ class PromptDetailScreen(ModalScreen):
                     yield Markdown(response)
                 if turn_json:
                     yield Rule()
+                    if source == "codex":
+                        yield Static("[b]Codex output (turn):[/]", classes="section-label")
+                        transcript = format_codex_turn_json(turn_json, width=100)
+                        if transcript:
+                            yield Markdown(transcript)
+                            yield Rule()
                     yield Static("[b]Turn timeline (raw JSON):[/]", classes="section-label")
                     yield Markdown(f"```json\n{turn_json}\n```")
             with Horizontal(id="detail-actions"):
