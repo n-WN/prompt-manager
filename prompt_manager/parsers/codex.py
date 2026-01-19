@@ -198,7 +198,7 @@ class CodexParser(BaseParser):
         """Parse legacy Codex rollouts stored as a single JSON document."""
         try:
             data = json.loads(file_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return
 
         if not isinstance(data, dict):
