@@ -147,15 +147,20 @@ class CodexParser(BaseParser):
             if isinstance(item, ResponseItemItem) and item.message and item.message.role == "assistant":
                 text = self._extract_text_blocks(item.message.content, {"output_text", "text"})
                 if text:
-                    pending_response_parts.append(text)
+                    if not pending_has_structured_response and pending_response_parts:
+                        pending_response_parts = []
+                    if not pending_response_parts or pending_response_parts[-1] != text:
+                        pending_response_parts.append(text)
                     pending_has_structured_response = True
             elif (
                 isinstance(item, EventMsgItem)
                 and not pending_has_structured_response
                 and isinstance(item.event, AgentMessageEvent)
             ):
-                if item.event.message.strip():
-                    pending_response_parts.append(item.event.message)
+                message = item.event.message.strip()
+                if message:
+                    if not pending_response_parts or pending_response_parts[-1] != message:
+                        pending_response_parts.append(message)
 
         if pending_content and pending_content.strip():
             timestamp = self.parse_timestamp(pending_ts)

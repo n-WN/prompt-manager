@@ -149,6 +149,16 @@ class SyncProgressScreen(ModalScreen):
     def __init__(self, title: str):
         super().__init__()
         self._title = title
+        self._sub_indeterminate = False
+        self._sub_pulse_value = 0
+        self._sub_pulse_timer: Optional[Timer] = None
+
+    def on_mount(self) -> None:
+        self._sub_pulse_timer = self.set_interval(0.12, self._pulse_subprogress)
+
+    def on_unmount(self) -> None:
+        if self._sub_pulse_timer is not None:
+            self._sub_pulse_timer.stop()
 
     def compose(self) -> ComposeResult:
         with Container(id="sync-dialog"):
@@ -158,6 +168,17 @@ class SyncProgressScreen(ModalScreen):
             yield ProgressBar(total=1, show_percentage=False, show_eta=False, id="sync-subprogress")
             yield ProgressBar(total=1, id="sync-progress")
 
+    def _pulse_subprogress(self) -> None:
+        if not self._sub_indeterminate:
+            return
+        self._sub_pulse_value = (self._sub_pulse_value + 3) % 100
+        try:
+            self.query_one("#sync-subprogress", ProgressBar).update(
+                total=100, progress=self._sub_pulse_value
+            )
+        except Exception:
+            return
+
     def update_progress(self, progress: SyncProgress) -> None:
         total = max(progress.files_total, 1)
         self.query_one("#sync-progress", ProgressBar).update(
@@ -166,11 +187,18 @@ class SyncProgressScreen(ModalScreen):
 
         sub_bar = self.query_one("#sync-subprogress", ProgressBar)
         if progress.phase == "syncing" and not progress.skipped:
-            if progress.file_items_total:
-                sub_bar.update(total=max(int(progress.file_items_total), 1), progress=progress.file_items_done)
+            if progress.file_items_total is not None:
+                self._sub_indeterminate = False
+                sub_total = max(int(progress.file_items_total), 1)
+                sub_bar.update(total=sub_total, progress=min(progress.file_items_done, sub_total))
             else:
-                sub_bar.update(total=None)
+                if not self._sub_indeterminate:
+                    self._sub_pulse_value = 0
+                self._sub_indeterminate = True
+                sub_bar.update(total=100, progress=self._sub_pulse_value)
         else:
+            self._sub_indeterminate = False
+            self._sub_pulse_value = 0
             sub_bar.update(total=1, progress=0)
 
         file_label = ""
