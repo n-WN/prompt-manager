@@ -80,6 +80,13 @@ class ForkConfirmScreen(ModalScreen):
         elif source == "gemini_cli":
             cmd = "gemini"
             desc = "Launch Gemini CLI (new session)"
+        elif source == "amp":
+            if session_id and session_id != "N/A":
+                cmd = f"amp threads handoff {session_id}"
+                desc = "Create a new Amp thread from an existing thread (handoff)"
+            else:
+                cmd = "amp"
+                desc = "Launch Amp CLI (new thread)"
         else:
             cmd = "N/A"
             desc = "Unknown agent type"
@@ -324,6 +331,7 @@ class HelpScreen(ModalScreen):
 - `/` Focus search
 - `ctrl+p` Command palette
 - `1-5` Filter source (All/Claude/Cursor/Aider/Codex)
+- `m` Filter Amp
 - `g` Filter Gemini CLI
 - `6` Starred only
 - `s` Sync new prompts
@@ -723,6 +731,7 @@ class PromptManagerApp(App):
         Binding("2", "filter_claude", "Claude"),
         Binding("3", "filter_cursor", "Cursor"),
         Binding("4", "filter_aider", "Aider"),
+        Binding("m", "filter_amp", "Amp"),
         Binding("5", "filter_codex", "Codex"),
         Binding("g", "filter_gemini", "Gemini"),
         Binding("6", "filter_starred", "Starred"),
@@ -750,6 +759,7 @@ class PromptManagerApp(App):
                     yield Button("Claude", id="btn-claude")
                     yield Button("Cursor", id="btn-cursor")
                     yield Button("Aider", id="btn-aider")
+                    yield Button("Amp", id="btn-amp")
                     yield Button("Codex", id="btn-codex")
                     yield Button("Gemini", id="btn-gemini")
                     yield Button("★", id="btn-starred")
@@ -787,14 +797,14 @@ class PromptManagerApp(App):
 
     def _display_session_label(self, source: str, session: str, prompts_in_session: list[dict]) -> str:
         session_short = session[:12] + "..." if len(session) > 12 else session
-        if source != "gemini_cli":
+        if source not in {"gemini_cli", "amp"}:
             return session_short
 
         if not prompts_in_session:
             sid = session[:8] if session else ""
             return f"[dim]{sid}[/]" if sid else session_short
 
-        # Gemini sessions are keyed by UUID/hash. Use an early user prompt as a human title.
+        # Gemini/Amp sessions are keyed by UUID/hash. Use an early user prompt as a human title.
         oldest = prompts_in_session[-1]
         content = (oldest.get("content") or "").strip()
         title = content.splitlines()[0].strip() if content else ""
@@ -812,7 +822,7 @@ class PromptManagerApp(App):
         query = (self.search_query or "").strip() or None
 
         if self.current_filter is None and not self.starred_only and query is None:
-            sources = ["claude_code", "cursor", "aider", "codex", "gemini_cli"]
+            sources = ["claude_code", "cursor", "aider", "amp", "codex", "gemini_cli"]
             per_source = max(50, 1000 // max(len(sources), 1))
             self.prompts = search_prompt_summaries_balanced(
                 self.conn,
@@ -851,6 +861,7 @@ class PromptManagerApp(App):
             "codex": "[green]Cx[/]",
             "aider": "[yellow]A[/]",
             "gemini_cli": "[blue]Gm[/]",
+            "amp": "[red]Am[/]",
         }
         source_labels = {
             "claude_code": "Claude",
@@ -858,6 +869,7 @@ class PromptManagerApp(App):
             "codex": "Codex",
             "aider": "Aider",
             "gemini_cli": "Gemini",
+            "amp": "Amp",
         }
 
         for source in sorted(grouped.keys()):
@@ -963,7 +975,7 @@ class PromptManagerApp(App):
         stats_text = (
             f"{stats['total']} prompts | "
             f"C:{stats['claude_code']} Cu:{stats['cursor']} A:{stats['aider']} "
-            f"Cx:{stats['codex']} Gm:{stats['gemini_cli']} | "
+            f"Am:{stats['amp']} Cx:{stats['codex']} Gm:{stats['gemini_cli']} | "
             f"★:{stats['starred']}"
         )
         self.query_one("#stats-bar", Static).update(stats_text)
@@ -1108,6 +1120,7 @@ class PromptManagerApp(App):
             ("filter_claude", "Filter Claude Code"),
             ("filter_cursor", "Filter Cursor"),
             ("filter_aider", "Filter Aider"),
+            ("filter_amp", "Filter Amp"),
             ("filter_codex", "Filter Codex"),
             ("filter_gemini", "Filter Gemini CLI"),
             ("filter_starred", "Starred only"),
@@ -1177,6 +1190,7 @@ class PromptManagerApp(App):
             "btn-claude": ("claude_code", False),
             "btn-cursor": ("cursor", False),
             "btn-aider": ("aider", False),
+            "btn-amp": ("amp", False),
             "btn-codex": ("codex", False),
             "btn-gemini": ("gemini_cli", False),
             "btn-starred": (None, True),
@@ -1201,6 +1215,9 @@ class PromptManagerApp(App):
 
     def action_filter_aider(self) -> None:
         self._set_filter("aider")
+
+    def action_filter_amp(self) -> None:
+        self._set_filter("amp")
 
     def action_filter_codex(self) -> None:
         self._set_filter("codex")
@@ -1264,6 +1281,10 @@ class PromptManagerApp(App):
     @on(Button.Pressed, "#btn-aider")
     def on_aider(self) -> None:
         self.action_filter_aider()
+
+    @on(Button.Pressed, "#btn-amp")
+    def on_amp(self) -> None:
+        self.action_filter_amp()
 
     @on(Button.Pressed, "#btn-codex")
     def on_codex(self) -> None:
@@ -1352,6 +1373,10 @@ class PromptManagerApp(App):
             # Gemini CLI: start a new session (no reliable resume command inferred)
             work_dir = os.path.expanduser("~")
             cmd = ["gemini"]
+        elif source == "amp":
+            # Amp: create a new thread via handoff, or start fresh
+            work_dir = resolve_work_dir(project)
+            cmd = ["amp", "threads", "handoff", session_id] if session_id else ["amp"]
         else:
             self.notify(f"Unknown source: {source}", severity="error")
             return
@@ -1371,6 +1396,8 @@ class PromptManagerApp(App):
                 self.notify(f"Forking session {session_id[:8]}... in {work_dir}")
             elif source == "codex" and session_id:
                 self.notify(f"Forking Codex session {session_id[:8]}... in {work_dir}")
+            elif source == "amp" and session_id:
+                self.notify(f"Handing off Amp thread {session_id[:8]}... in {work_dir}")
             else:
                 self.notify(f"Launching {source} in {work_dir}")
         except Exception as e:

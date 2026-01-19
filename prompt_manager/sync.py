@@ -15,6 +15,7 @@ from .parsers.cursor import CursorParser
 from .parsers.aider import AiderParser
 from .parsers.codex import CodexParser
 from .parsers.gemini_cli import GeminiCliParser
+from .parsers.amp import AmpParser
 
 if TYPE_CHECKING:
     from .parsers import BaseParser
@@ -354,6 +355,7 @@ def sync_all(
         "aider": 0,
         "codex": 0,
         "gemini_cli": 0,
+        "amp": 0,
         "total": 0,
         "files_checked": 0,
         "files_updated": 0,
@@ -365,6 +367,7 @@ def sync_all(
         AiderParser(),
         CodexParser(),
         GeminiCliParser(),
+        AmpParser(),
     ]
 
     # Ensure all sources exist in the counts dict even when custom parsers are provided.
@@ -630,6 +633,7 @@ def sync_source(source: str, conn: Optional[duckdb.DuckDBPyConnection] = None, f
         "aider": AiderParser,
         "codex": CodexParser,
         "gemini_cli": GeminiCliParser,
+        "amp": AmpParser,
     }
 
     if source not in parser_map:
@@ -666,6 +670,7 @@ def check_updates(conn: Optional[duckdb.DuckDBPyConnection] = None) -> dict:
         "aider": 0,
         "codex": 0,
         "gemini_cli": 0,
+        "amp": 0,
     }
 
     parsers = [
@@ -674,6 +679,7 @@ def check_updates(conn: Optional[duckdb.DuckDBPyConnection] = None) -> dict:
         AiderParser(),
         CodexParser(),
         GeminiCliParser(),
+        AmpParser(),
     ]
 
     for parser in parsers:
