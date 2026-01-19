@@ -1,6 +1,7 @@
 """DuckDB database operations for prompt storage."""
 
 import duckdb
+import json
 import os
 import sys
 import zlib
@@ -86,6 +87,42 @@ def _load_jsonl_range_as_array(path: str, start: int, end: int) -> Optional[str]
         return None
     return "[" + ",".join(lines) + "]"
 
+def _load_amp_thread_range_as_array(path: str, start: int, end: int) -> Optional[str]:
+    try:
+        start_i = int(start)
+        end_i = int(end)
+    except Exception:
+        return None
+
+    if start_i < 0 or end_i <= start_i:
+        return None
+
+    try:
+        data = Path(path).read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    try:
+        obj = json.loads(data)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    messages = obj.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+
+    start_i = min(start_i, len(messages))
+    end_i = min(end_i, len(messages))
+    if end_i <= start_i:
+        return None
+
+    try:
+        return json.dumps(messages[start_i:end_i], ensure_ascii=False)
+    except Exception:
+        return None
+
 
 def pack_large_text(
     text: Optional[str],
@@ -145,7 +182,7 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS prompts (
             id VARCHAR PRIMARY KEY,
-            source VARCHAR NOT NULL,           -- 'claude_code', 'cursor', 'aider', 'codex', 'gemini_cli'
+            source VARCHAR NOT NULL,           -- 'claude_code', 'cursor', 'aider', 'codex', 'gemini_cli', 'amp'
             project_path VARCHAR,              -- Original project path
             session_id VARCHAR,                -- Session/conversation ID
             origin_path VARCHAR,               -- Source log file path (read-only reference)
@@ -535,6 +572,21 @@ def get_prompt(conn: duckdb.DuckDBPyConnection, prompt_id: str) -> Optional[dict
         if restored is not None:
             row["turn_json"] = restored
 
+    if (
+        row.get("turn_json") is None
+        and row.get("source") == "amp"
+        and row.get("origin_path")
+        and row.get("origin_offset_start") is not None
+        and row.get("origin_offset_end") is not None
+    ):
+        restored = _load_amp_thread_range_as_array(
+            str(row["origin_path"]),
+            int(row["origin_offset_start"]),
+            int(row["origin_offset_end"]),
+        )
+        if restored is not None:
+            row["turn_json"] = restored
+
     row.pop("response_blob", None)
     row.pop("turn_json_blob", None)
     return row
@@ -600,6 +652,7 @@ def get_stats(conn: duckdb.DuckDBPyConnection) -> dict:
             COUNT(CASE WHEN source = 'aider' THEN 1 END) as aider,
             COUNT(CASE WHEN source = 'codex' THEN 1 END) as codex,
             COUNT(CASE WHEN source = 'gemini_cli' THEN 1 END) as gemini_cli,
+            COUNT(CASE WHEN source = 'amp' THEN 1 END) as amp,
             COUNT(CASE WHEN starred THEN 1 END) as starred,
             SUM(use_count) as total_uses
         FROM prompts
@@ -612,8 +665,9 @@ def get_stats(conn: duckdb.DuckDBPyConnection) -> dict:
         'aider': result[3],
         'codex': result[4],
         'gemini_cli': result[5],
-        'starred': result[6],
-        'total_uses': result[7] or 0,
+        'amp': result[6],
+        'starred': result[7],
+        'total_uses': result[8] or 0,
     }
 
 

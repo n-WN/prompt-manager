@@ -1,5 +1,8 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import duckdb
 
@@ -146,5 +149,50 @@ class TestDuckDbSchema(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row["response"], response)
             self.assertEqual(row["turn_json"], turn_json)
+        finally:
+            conn.close()
+
+    def test_amp_turn_json_hydrates_from_origin_indices(self) -> None:
+        conn = duckdb.connect(":memory:")
+        try:
+            _init_schema(conn)
+            with tempfile.TemporaryDirectory() as tmp:
+                thread_path = Path(tmp) / "T-1.json"
+                thread_path.write_text(
+                    json.dumps(
+                        {
+                            "id": "T-1",
+                            "messages": [
+                                {"role": "user", "messageId": 0, "content": [{"type": "text", "text": "hi"}]},
+                                {"role": "assistant", "messageId": 1, "content": [{"type": "text", "text": "ok"}]},
+                                {"role": "user", "messageId": 2, "content": [{"type": "tool_result"}]},
+                                {"role": "assistant", "messageId": 3, "content": [{"type": "text", "text": "done"}]},
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+                insert_prompt(
+                    conn,
+                    id="p1",
+                    source="amp",
+                    content="hi",
+                    session_id="T-1",
+                    origin_path=str(thread_path),
+                    origin_offset_start=0,
+                    origin_offset_end=3,
+                    response="ok",
+                    turn_json=None,
+                )
+
+                row = get_prompt(conn, "p1")
+                self.assertIsNotNone(row)
+                turn = json.loads(row.get("turn_json") or "null")
+                self.assertIsInstance(turn, list)
+                self.assertEqual(len(turn), 3)
+                self.assertEqual(turn[0].get("role"), "user")
+                self.assertEqual(turn[1].get("role"), "assistant")
         finally:
             conn.close()

@@ -7,6 +7,7 @@ from pathlib import Path
 from prompt_manager.parsers.claude_code import ClaudeCodeParser
 from prompt_manager.parsers.codex import CodexParser
 from prompt_manager.parsers.cursor import CursorParser
+from prompt_manager.parsers.amp import AmpParser
 from prompt_manager.parsers.gemini_cli import GeminiCliParser
 
 
@@ -282,6 +283,84 @@ class TestCodexParser(unittest.TestCase):
             seg1 = raw[prompts[1].origin_offset_start : prompts[1].origin_offset_end].decode("utf-8")
             self.assertNotIn("short2", seg0)
             self.assertIn("short2", seg1)
+
+
+class TestAmpParser(unittest.TestCase):
+    def test_parses_thread_json_and_skips_tool_result_user_messages(self) -> None:
+        parser = AmpParser(base_path=Path("/does/not/matter"))
+        with tempfile.TemporaryDirectory() as tmp:
+            threads_dir = Path(tmp) / "threads"
+            threads_dir.mkdir(parents=True)
+            thread_path = threads_dir / "T-123.json"
+            thread_path.write_text(
+                json.dumps(
+                    {
+                        "v": 1,
+                        "id": "T-123",
+                        "created": 1700000000000,
+                        "env": {
+                            "initial": {
+                                "trees": [{"displayName": "repo", "uri": "file:///tmp/repo"}]
+                            }
+                        },
+                        "messages": [
+                            {
+                                "role": "user",
+                                "messageId": 0,
+                                "content": [{"type": "text", "text": "hi"}],
+                                "meta": {"sentAt": 1700000000001},
+                            },
+                            {
+                                "role": "assistant",
+                                "messageId": 1,
+                                "content": [{"type": "tool_use", "id": "t1", "name": "Bash"}],
+                            },
+                            {
+                                "role": "user",
+                                "messageId": 2,
+                                "content": [{"type": "tool_result", "toolUseID": "t1", "run": {"status": "done"}}],
+                            },
+                            {
+                                "role": "assistant",
+                                "messageId": 3,
+                                "content": [{"type": "text", "text": "answer"}],
+                            },
+                            {
+                                "role": "user",
+                                "messageId": 4,
+                                "content": [{"type": "text", "text": "next"}],
+                                "meta": {"sentAt": 1700000000002},
+                            },
+                            {
+                                "role": "assistant",
+                                "messageId": 5,
+                                "content": [{"type": "text", "text": "ok"}],
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            # Point parser at our temp data root.
+            parser = AmpParser(base_path=Path(tmp))
+            prompts = list(parser.parse_file(thread_path))
+            self.assertEqual(len(prompts), 2)
+
+            self.assertEqual(prompts[0].source, "amp")
+            self.assertEqual(prompts[0].session_id, "T-123")
+            self.assertEqual(prompts[0].project_path, "/tmp/repo")
+            self.assertEqual(prompts[0].content, "hi")
+            self.assertEqual(prompts[0].response, "answer")
+            self.assertIsNone(prompts[0].turn_json)
+            self.assertEqual(prompts[0].origin_offset_start, 0)
+            self.assertEqual(prompts[0].origin_offset_end, 4)
+
+            self.assertEqual(prompts[1].content, "next")
+            self.assertEqual(prompts[1].response, "ok")
+            self.assertEqual(prompts[1].origin_offset_start, 4)
+            self.assertEqual(prompts[1].origin_offset_end, 6)
 
 
 class TestCursorStateVscdbParser(unittest.TestCase):

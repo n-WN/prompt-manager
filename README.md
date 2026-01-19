@@ -12,6 +12,7 @@ A TUI tool to manage and search prompts from various AI coding assistants.
   - Codex CLI (session rollouts)
   - Aider (markdown logs)
   - Gemini CLI (session JSON)
+  - Amp CLI (thread JSON)
 - Full-text search across all prompts
 - Tree-based navigation by source/project/session
 - Preview prompts and responses with Markdown rendering
@@ -67,6 +68,7 @@ prompt-manager
 | `?` | Help |
 | `/` | Focus search |
 | `1-5` | Filter by source (All/Claude/Cursor/Aider/Codex) |
+| `m` | Filter Amp |
 | `g` | Filter Gemini CLI |
 | `6` | Filter starred |
 | `s` | Sync new prompts |
@@ -101,6 +103,7 @@ You can inspect and clean it with:
   - `~/.codex/sessions/` (Codex)
   - `~/.aider.chat.history.md` (Aider)
   - `~/.gemini/tmp/**/chats/` (Gemini CLI)
+  - `~/.local/share/amp/threads/` (Amp)
 
 ## Tech Stack
 
