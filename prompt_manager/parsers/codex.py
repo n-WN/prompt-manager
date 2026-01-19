@@ -6,6 +6,15 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from . import BaseParser, ParsedPrompt
+from ..codex_schema import (
+    AgentMessageEvent,
+    EventMsgItem,
+    ResponseItemItem,
+    SessionMetaItem,
+    TurnContextItem,
+    UserMessageEvent,
+    iter_rollout_lines,
+)
 
 _UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
@@ -59,103 +68,84 @@ class CodexParser(BaseParser):
         pending_has_structured_response = False
         pending_turn_lines: list[dict] = []
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                obj = self._load_json_line(line)
-                if obj is None:
-                    continue
+        for line in iter_rollout_lines(file_path):
+            item = line.item
+            raw = line.raw
 
-                item_type = obj.get("type")
-                payload = obj.get("payload")
+            if session_id is None and isinstance(item, SessionMetaItem):
+                session_id = item.payload.id or None
+                project_path = item.payload.cwd or project_path
+                continue
 
-                if session_id is None and item_type == "session_meta" and isinstance(payload, dict):
-                    session_id = payload.get("id") or None
-                    project_path = payload.get("cwd") or project_path
-                    continue
+            if project_path is None and isinstance(item, TurnContextItem):
+                cwd = item.raw.get("cwd")
+                if isinstance(cwd, str):
+                    project_path = cwd
 
-                if project_path is None and item_type == "turn_context" and isinstance(payload, dict):
-                    project_path = payload.get("cwd") or project_path
+            # In sessions with `event_msg` user markers, `response_item` user messages can
+            # appear *before* the corresponding `event_msg` user_message. Treat those as
+            # carryover so per-turn timelines don't accidentally include the next prompt.
+            if has_user_events and isinstance(item, ResponseItemItem) and item.message and item.message.role == "user":
+                carryover_lines.append(raw)
+                continue
 
-                # In sessions with `event_msg` user markers, `response_item` user messages can
-                # appear *before* the corresponding `event_msg` user_message. Treat those as
-                # carryover so per-turn timelines don't accidentally include the next prompt.
-                if (
-                    has_user_events
-                    and item_type == "response_item"
-                    and isinstance(payload, dict)
-                    and payload.get("type") == "message"
-                    and payload.get("role") == "user"
-                ):
-                    carryover_lines.append(obj)
-                    continue
+            if has_user_events:
+                is_user_marker = isinstance(item, EventMsgItem) and isinstance(item.event, UserMessageEvent)
+                user_message = item.event.message if is_user_marker else None
+            else:
+                is_user_marker = isinstance(item, ResponseItemItem) and item.message and item.message.role == "user"
+                user_message = (
+                    self._extract_text_blocks(item.message.content, {"input_text", "text"})
+                    if is_user_marker and item.message
+                    else None
+                )
 
-                if has_user_events:
-                    is_user_marker = (
-                        item_type == "event_msg"
-                        and isinstance(payload, dict)
-                        and payload.get("type") == "user_message"
+            if is_user_marker:
+                if pending_content and pending_content.strip():
+                    timestamp = self.parse_timestamp(pending_ts)
+                    prompt_id = self.generate_id(
+                        self.source_name,
+                        pending_content,
+                        session_id or self._extract_session_id_from_path(file_path),
+                        pending_ts or "",
                     )
-                    user_message = payload.get("message") if isinstance(payload, dict) else None
-                else:
-                    is_user_marker = (
-                        item_type == "response_item"
-                        and isinstance(payload, dict)
-                        and payload.get("type") == "message"
-                        and payload.get("role") == "user"
-                    )
-                    user_message = (
-                        self._extract_text_blocks(payload.get("content"), {"input_text", "text"})
-                        if isinstance(payload, dict)
-                        else None
+                    yield ParsedPrompt(
+                        id=prompt_id,
+                        source=self.source_name,
+                        content=pending_content,
+                        project_path=project_path,
+                        session_id=session_id,
+                        timestamp=timestamp,
+                        response="\n".join(pending_response_parts) if pending_response_parts else None,
+                        turn_json=json.dumps(pending_turn_lines, ensure_ascii=False) if pending_turn_lines else None,
                     )
 
-                if is_user_marker:
-                    if pending_content and pending_content.strip():
-                        timestamp = self.parse_timestamp(pending_ts)
-                        prompt_id = self.generate_id(
-                            self.source_name,
-                            pending_content,
-                            session_id or self._extract_session_id_from_path(file_path),
-                            pending_ts or "",
-                        )
-                        yield ParsedPrompt(
-                            id=prompt_id,
-                            source=self.source_name,
-                            content=pending_content,
-                            project_path=project_path,
-                            session_id=session_id,
-                            timestamp=timestamp,
-                            response="\n".join(pending_response_parts) if pending_response_parts else None,
-                            turn_json=json.dumps(pending_turn_lines, ensure_ascii=False)
-                            if pending_turn_lines
-                            else None,
-                        )
+                pending_content = user_message if isinstance(user_message, str) else ""
+                pending_ts = line.timestamp
+                pending_response_parts = []
+                pending_has_structured_response = False
+                pending_turn_lines = carryover_lines + [raw]
+                carryover_lines = []
+                continue
 
-                    pending_content = user_message if isinstance(user_message, str) else ""
-                    pending_ts = obj.get("timestamp")
-                    pending_response_parts = []
-                    pending_has_structured_response = False
-                    pending_turn_lines = carryover_lines + [obj]
-                    carryover_lines = []
-                    continue
+            if pending_content is None:
+                continue
 
-                if pending_content is None:
-                    continue
+            pending_turn_lines.append(raw)
 
-                pending_turn_lines.append(obj)
-
-                # Prefer structured assistant response items; fall back to event msg if needed.
-                if item_type == "response_item" and isinstance(payload, dict):
-                    if payload.get("type") == "message" and payload.get("role") == "assistant":
-                        text = self._extract_text_blocks(payload.get("content"), {"output_text", "text"})
-                        if text:
-                            pending_response_parts.append(text)
-                            pending_has_structured_response = True
-                elif item_type == "event_msg" and isinstance(payload, dict):
-                    if not pending_has_structured_response and payload.get("type") == "agent_message":
-                        text = payload.get("message")
-                        if isinstance(text, str) and text.strip():
-                            pending_response_parts.append(text)
+            # Prefer structured assistant response items; fall back to event msg if needed.
+            if isinstance(item, ResponseItemItem) and item.message and item.message.role == "assistant":
+                text = self._extract_text_blocks(item.message.content, {"output_text", "text"})
+                if text:
+                    pending_response_parts.append(text)
+                    pending_has_structured_response = True
+            elif (
+                isinstance(item, EventMsgItem)
+                and not pending_has_structured_response
+                and isinstance(item.event, AgentMessageEvent)
+            ):
+                if item.event.message.strip():
+                    pending_response_parts.append(item.event.message)
 
         if pending_content and pending_content.strip():
             timestamp = self.parse_timestamp(pending_ts)
@@ -178,16 +168,9 @@ class CodexParser(BaseParser):
 
     def _jsonl_has_user_events(self, file_path: Path) -> bool:
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    obj = self._load_json_line(line)
-                    if obj is None:
-                        continue
-                    if obj.get("type") != "event_msg":
-                        continue
-                    payload = obj.get("payload")
-                    if isinstance(payload, dict) and payload.get("type") == "user_message":
-                        return True
+            for line in iter_rollout_lines(file_path):
+                if isinstance(line.item, EventMsgItem) and isinstance(line.item.event, UserMessageEvent):
+                    return True
         except OSError:
             return False
         return False

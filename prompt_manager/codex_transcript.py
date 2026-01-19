@@ -8,7 +8,18 @@ import shutil
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
+
+from .codex_schema import (
+    AgentMessageEvent,
+    AgentReasoningEvent,
+    EventMsgItem,
+    RolloutLine,
+    SessionMetaItem,
+    TokenCountEvent,
+    UserMessageEvent,
+    iter_rollout_lines as iter_codex_rollout_lines,
+)
 
 
 _REASONING_TITLE_RE = re.compile(r"^\*\*(.+?)\*\*\s*$")
@@ -21,21 +32,6 @@ class CodexTurnView:
     agent_messages: list[str]
 
 
-def iter_rollout_lines(path: Path) -> Iterator[dict]:
-    """Yield JSON objects from a Codex rollout JSONL file."""
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                yield obj
-
-
 def extract_turn_views_from_rollout(path: Path) -> tuple[Optional[str], list[CodexTurnView], Optional[dict]]:
     """Parse a rollout JSONL into user-visible turns plus last token usage."""
     session_id: Optional[str] = None
@@ -43,48 +39,41 @@ def extract_turn_views_from_rollout(path: Path) -> tuple[Optional[str], list[Cod
     current: Optional[CodexTurnView] = None
     last_total_token_usage: Optional[dict] = None
 
-    for line in iter_rollout_lines(path):
-        item_type = line.get("type")
-        payload = line.get("payload")
-
-        if item_type == "session_meta" and isinstance(payload, dict):
-            session_id = payload.get("id") or session_id
+    for line in iter_codex_rollout_lines(path):
+        if isinstance(line.item, SessionMetaItem):
+            sid = line.item.payload.id
+            if sid:
+                session_id = sid
             continue
 
-        if item_type != "event_msg" or not isinstance(payload, dict):
+        if not isinstance(line.item, EventMsgItem):
             continue
 
-        ev_type = payload.get("type")
-        if ev_type == "user_message":
+        event = line.item.event
+        if isinstance(event, UserMessageEvent):
             if current is not None:
                 turns.append(current)
-            user_message = payload.get("message")
             current = CodexTurnView(
-                user_message=user_message if isinstance(user_message, str) else "",
+                user_message=event.message,
                 reasoning_segments=[],
                 agent_messages=[],
             )
             continue
 
-        if ev_type == "token_count":
-            info = payload.get("info")
-            if isinstance(info, dict):
-                total_usage = info.get("total_token_usage")
-                if isinstance(total_usage, dict):
-                    last_total_token_usage = total_usage
+        if isinstance(event, TokenCountEvent):
+            info = event.info or {}
+            total_usage = info.get("total_token_usage")
+            if isinstance(total_usage, dict):
+                last_total_token_usage = total_usage
             continue
 
         if current is None:
             continue
 
-        if ev_type == "agent_reasoning":
-            text = payload.get("text")
-            if isinstance(text, str) and text.strip():
-                current.reasoning_segments.append(text)
-        elif ev_type == "agent_message":
-            msg = payload.get("message")
-            if isinstance(msg, str) and msg.strip():
-                current.agent_messages.append(msg)
+        if isinstance(event, AgentReasoningEvent) and event.text.strip():
+            current.reasoning_segments.append(event.text)
+        elif isinstance(event, AgentMessageEvent) and event.message.strip():
+            current.agent_messages.append(event.message)
 
     if current is not None:
         turns.append(current)
@@ -94,40 +83,31 @@ def extract_turn_views_from_rollout(path: Path) -> tuple[Optional[str], list[Cod
 
 def extract_turn_view_from_turn_json(turn_json: str) -> Optional[CodexTurnView]:
     """Build a CodexTurnView from a per-turn `turn_json` timeline."""
-    try:
-        timeline = json.loads(turn_json)
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(timeline, list):
-        return None
-
     user_message: Optional[str] = None
     reasoning_segments: list[str] = []
     agent_messages: list[str] = []
 
-    for line in timeline:
-        if not isinstance(line, dict):
-            continue
-        if line.get("type") != "event_msg":
-            continue
-        payload = line.get("payload")
-        if not isinstance(payload, dict):
-            continue
+    # turn_json is a JSON array of raw RolloutLine dicts.
+    try:
+        timeline_raw = json.loads(turn_json)
+    except Exception:
+        return None
+    if not isinstance(timeline_raw, list):
+        return None
 
-        ev_type = payload.get("type")
-        if ev_type == "user_message" and user_message is None:
-            msg = payload.get("message")
-            if isinstance(msg, str):
-                user_message = msg
-        elif ev_type == "agent_reasoning":
-            text = payload.get("text")
-            if isinstance(text, str) and text.strip():
-                reasoning_segments.append(text)
-        elif ev_type == "agent_message":
-            msg = payload.get("message")
-            if isinstance(msg, str) and msg.strip():
-                agent_messages.append(msg)
+    for raw in timeline_raw:
+        if not isinstance(raw, dict):
+            continue
+        line = RolloutLine.from_dict(raw)
+        if line is None or not isinstance(line.item, EventMsgItem):
+            continue
+        event = line.item.event
+        if isinstance(event, UserMessageEvent) and user_message is None:
+            user_message = event.message
+        elif isinstance(event, AgentReasoningEvent) and event.text.strip():
+            reasoning_segments.append(event.text)
+        elif isinstance(event, AgentMessageEvent) and event.message.strip():
+            agent_messages.append(event.message)
 
     if user_message is None:
         return None
