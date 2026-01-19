@@ -54,16 +54,16 @@ def _init_file_state_table(conn: duckdb.DuckDBPyConnection) -> None:
     """)
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info('file_sync_state')").fetchall()}
-    except Exception as e:
-        logging.debug("Could not inspect file_sync_state columns: %s", e)
-        return
+    except duckdb.Error:
+        logging.exception("failed to read table_info for file_sync_state")
+        raise
 
     if "sync_version" not in columns:
         try:
             conn.execute("ALTER TABLE file_sync_state ADD COLUMN sync_version INTEGER DEFAULT 1")
-        except Exception as e:
-            logging.debug("Could not add sync_version column: %s", e)
-            return
+        except duckdb.Error:
+            logging.exception("failed to add sync_version column")
+            raise
 
     conn.execute("UPDATE file_sync_state SET sync_version = 1 WHERE sync_version IS NULL")
 
@@ -352,19 +352,21 @@ def sync_all(
                 _source: str = current_source,
                 _file_path: Path = current_file_path,
                 _idx: int = current_idx,
+                _progress: Optional[ProgressCallback] = progress,
+                _files_updated: int = current_files_updated,
             ) -> None:
                 nonlocal file_items_done
                 file_items_done = items_done
-                if progress is None:
+                if _progress is None:
                     return
-                progress(
+                _progress(
                     SyncProgress(
                         phase="syncing",
                         source=_source,
                         file_path=_file_path,
                         files_checked=_idx,
                         files_total=files_total,
-                        files_updated=current_files_updated,
+                        files_updated=_files_updated,
                         new_prompts_total=counts["total"] + inserted_so_far,
                         new_prompts_in_file=inserted_so_far,
                         file_items_done=items_done,
