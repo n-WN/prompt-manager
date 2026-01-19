@@ -18,6 +18,7 @@ from typing import Optional
 from collections import defaultdict
 import platform
 import pyperclip
+from rich.markup import escape as escape_markup
 import shlex
 import shutil
 import subprocess
@@ -775,6 +776,37 @@ class PromptManagerApp(App):
             except Exception:
                 pass
 
+    def _display_project_label(self, source: str, project: str) -> str:
+        if source == "gemini_cli":
+            if project.startswith("gemini_cli:"):
+                project_hash = project.split(":", 1)[1]
+                if project_hash:
+                    return f"Gemini {project_hash[:8]}"
+            return "Gemini"
+        return project.split("/")[-1] if "/" in project else project
+
+    def _display_session_label(self, source: str, session: str, prompts_in_session: list[dict]) -> str:
+        session_short = session[:12] + "..." if len(session) > 12 else session
+        if source != "gemini_cli":
+            return session_short
+
+        if not prompts_in_session:
+            sid = session[:8] if session else ""
+            return f"[dim]{sid}[/]" if sid else session_short
+
+        # Gemini sessions are keyed by UUID/hash. Use an early user prompt as a human title.
+        oldest = prompts_in_session[-1]
+        content = (oldest.get("content") or "").strip()
+        title = content.splitlines()[0].strip() if content else ""
+        if not title:
+            title = content.replace("\n", " ").strip()
+
+        title = escape_markup(title[:60])
+        sid = session[:8] if session else ""
+        if title and sid:
+            return f"{title} [dim]{sid}[/]"
+        return title or session_short
+
     def load_prompts(self) -> None:
         """Load prompts and build tree by session."""
         query = (self.search_query or "").strip() or None
@@ -820,21 +852,29 @@ class PromptManagerApp(App):
             "aider": "[yellow]A[/]",
             "gemini_cli": "[blue]Gm[/]",
         }
+        source_labels = {
+            "claude_code": "Claude",
+            "cursor": "Cursor",
+            "codex": "Codex",
+            "aider": "Aider",
+            "gemini_cli": "Gemini",
+        }
 
         for source in sorted(grouped.keys()):
             icon = source_icons.get(source, "[white]?[/]")
+            source_label = source_labels.get(source, source)
             source_count = sum(
                 len(prompts)
                 for projects in grouped[source].values()
                 for prompts in projects.values()
             )
             source_node = tree.root.add(
-                f"{icon} {source} ({source_count})",
+                f"{icon} {source_label} ({source_count})",
                 expand=len(grouped) == 1  # Auto-expand if single source
             )
 
             for project in sorted(grouped[source].keys()):
-                project_short = project.split("/")[-1] if "/" in project else project
+                project_short = self._display_project_label(source, project)
                 project_count = sum(len(p) for p in grouped[source][project].values())
                 project_node = source_node.add(
                     f"[blue]{project_short}[/] ({project_count})"
@@ -856,12 +896,12 @@ class PromptManagerApp(App):
                         reverse=True
                     )
 
-                    session_short = session[:12] + "..." if len(session) > 12 else session
+                    session_label = self._display_session_label(source, session, prompts_in_session)
                     first_ts = prompts_in_session[0].get("timestamp")
                     ts_str = first_ts.strftime("%m/%d") if first_ts else ""
 
                     session_node = project_node.add(
-                        f"[dim]{ts_str}[/] {session_short} ({len(prompts_in_session)})"
+                        f"[dim]{ts_str}[/] {session_label} ({len(prompts_in_session)})"
                     )
 
                     for prompt in prompts_in_session:
