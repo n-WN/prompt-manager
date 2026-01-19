@@ -44,6 +44,17 @@ class GeminiCliParser(BaseParser):
                 yield session_file
 
     def parse_file(self, file_path: Path) -> Iterator[ParsedPrompt]:
+        """
+        Parse a Gemini CLI session JSON file and yield ParsedPrompt objects for each user prompt turn.
+        
+        Parses the specified session file, extracts user messages as prompt turns, assembles the subsequent assistant messages as the turn response, and yields a ParsedPrompt for each valid user prompt.
+        
+        Parameters:
+            file_path (Path): Path to the Gemini CLI session JSON file to parse.
+        
+        Returns:
+            Iterator[ParsedPrompt]: An iterator that yields a ParsedPrompt for each user prompt found. Each ParsedPrompt includes a generated id, source ("gemini_cli"), the prompt content, project_path, session_id, parsed timestamp, the assembled response (or `None` if no response), and `turn_json` containing the JSON slice for that prompt turn.
+        """
         try:
             data = json.loads(file_path.read_text("utf-8"))
         except Exception:

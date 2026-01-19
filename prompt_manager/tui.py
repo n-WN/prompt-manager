@@ -299,6 +299,14 @@ class PromptDetailScreen(ModalScreen):
         self.prompt = prompt
 
     def compose(self) -> ComposeResult:
+        """
+        Render the prompt detail modal, including metadata, content, optional response, and turn JSON.
+        
+        This composes a dialog showing source, timestamp, project, session, the prompt content (as markdown), an optional response section, and, when available, codex-formatted transcript and raw turn JSON. If the prompt ID is present, attempts to fetch the full prompt (to obtain `turn_json`) using the app's DB connection; if no connection exists on the app, a temporary connection is created and closed. Any errors while loading `turn_json` are suppressed.
+        
+        Returns:
+            ComposeResult: A generator of UI components that make up the detail dialog.
+        """
         content = self.prompt.get("content", "")
         response = self.prompt.get("response") or ""
         source = self.prompt.get("source", "unknown")
@@ -363,6 +371,11 @@ class PromptDetailScreen(ModalScreen):
                 yield Button("Close", id="btn-close", variant="default")
 
     def action_copy(self) -> None:
+        """
+        Copy the current prompt's content to the clipboard and record a usage increment.
+        
+        Copies the prompt text to the system clipboard, increments the prompt's use count in the database (creating and closing a temporary connection if one is not available on the app), and notifies the user on success. If any error occurs during copy or database update, notifies the user with an error message.
+        """
         try:
             pyperclip.copy(self.prompt["content"])
             conn = getattr(self.app, "conn", None)
@@ -383,6 +396,11 @@ class PromptDetailScreen(ModalScreen):
             self.notify(f"Failed: {e}", severity="error")
 
     def action_star(self) -> None:
+        """
+        Toggle the starred status of the current prompt and close the detail dialog.
+        
+        Toggles the prompt's star flag in the database, updates the prompt's local "starred" field, displays a notification ("Starred!" or "Unstarred"), and dismisses the screen signaling that the caller should refresh. If the app has no open database connection, a temporary connection is created and closed after the operation.
+        """
         conn = getattr(self.app, "conn", None)
         created_conn = False
         if conn is None:
@@ -671,6 +689,19 @@ class PromptManagerApp(App):
     ]
 
     def __init__(self):
+        """
+        Initialize the app instance and its runtime state.
+        
+        Sets up a database connection and initializes UI/filtering/search state used throughout the application:
+        - conn: active DB connection from get_connection()
+        - current_filter: active source filter (None = show all)
+        - starred_only: whether to restrict view to starred prompts
+        - search_query: current search text
+        - prompts: list cache of prompt summaries
+        - prompt_map: mapping from prompt id to prompt dict
+        - selected_prompt: currently selected prompt or None
+        - _search_timer: optional Timer used to debounce search input
+        """
         super().__init__()
         self.conn = get_connection()
         self.current_filter: Optional[str] = None
@@ -682,6 +713,15 @@ class PromptManagerApp(App):
         self._search_timer: Optional[Timer] = None
 
     def compose(self) -> ComposeResult:
+        """
+        Compose the main application UI layout, yielding the header, footer, a two-pane grid, and the controls within each pane.
+        
+        Yields:
+        	A ComposeResult containing:
+        		- A Header and Footer.
+        		- A left panel with a search input, a row of source/filter buttons, a stats bar, and a Tree labeled "Sessions".
+        		- A right panel with a preview container showing a placeholder hint when no prompt is selected.
+        """
         yield Header()
         with Horizontal(id="app-grid"):
             with Vertical(id="left-panel"):
@@ -1104,6 +1144,14 @@ class PromptManagerApp(App):
 
     @on(Input.Changed, "#search-input")
     def on_search_changed(self, event: Input.Changed) -> None:
+        """
+        Handle changes to the search input by updating the query and debouncing application.
+        
+        Updates the internal search_query from the input event, cancels any pending debounce timer, and schedules _apply_search to run after a 0.25 second debounce interval.
+        
+        Parameters:
+            event (Input.Changed): The input change event containing the new value.
+        """
         self.search_query = event.value
 
         if self._search_timer is not None:
@@ -1117,6 +1165,9 @@ class PromptManagerApp(App):
         self._search_timer = self.set_timer(0.25, self._apply_search)
 
     def _apply_search(self) -> None:
+        """
+        Apply the pending search: clear the debounce timer, reload prompts using the current search/filter state, and reset the preview pane.
+        """
         self._search_timer = None
         self.load_prompts()
         self.update_preview(None)

@@ -7,6 +7,11 @@ from prompt_manager.db import _init_schema, insert_prompt, search_prompt_summari
 
 class TestDuckDbSchema(unittest.TestCase):
     def test_drops_content_index_and_allows_long_content(self) -> None:
+        """
+        Verifies that schema initialization removes a legacy content index and accepts very long prompt content.
+        
+        Initializes an in-memory DuckDB schema, simulates a legacy index on prompts(content), re-runs schema initialization and asserts the legacy index was dropped. Then inserts a prompt with very large content (130,000 characters) and asserts the insert succeeds. Uses a temporary in-memory connection that is closed on completion.
+        """
         conn = duckdb.connect(":memory:")
         try:
             _init_schema(conn)

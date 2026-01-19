@@ -7,6 +7,20 @@ from pathlib import Path
 
 
 def main():
+    """
+    Entry point for the Prompt Manager CLI that parses arguments and dispatches subcommands.
+    
+    Supports the following subcommands:
+    - tui (default): Launch the text-based user interface.
+    - sync: Sync prompts from configured sources; optional --source restricts to one source.
+    - search: Search stored prompts with optional --source, --starred, and --limit filters.
+    - stats: Print aggregated prompt statistics.
+    - codex-transcript: Format and print a Codex rollout transcript from a given path; accepts --width to control wrapping.
+    
+    Behavior:
+    - If no subcommand is provided, the TUI is launched.
+    - When running `codex-transcript`, the function exits with status code 2 if the provided path does not exist.
+    """
     parser = argparse.ArgumentParser(
         description="Prompt Manager - Manage and reuse prompts from Code Agent logs"
     )

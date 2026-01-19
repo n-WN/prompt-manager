@@ -40,7 +40,17 @@ class ClaudeCodeParser(BaseParser):
                     yield log_file
 
     def parse_file(self, file_path: Path) -> Iterator[ParsedPrompt]:
-        """Parse a Claude Code JSONL file."""
+        """
+        Parse a Claude Code JSONL log file and yield ParsedPrompt records for each detected user prompt.
+        
+        This reads the file line-by-line, ignores malformed or non-object lines, and groups each user message with subsequent assistant events until the next user message. The project_path is derived from the file's parent directory name (hyphens replaced with '/'); session_id is the file stem. Assistant responses are concatenated into `response`; `turn_json` contains a JSON-encoded array of the raw events for the turn. Timestamps are parsed from each user event's "timestamp" field. User prompts are recognized from events with type "user", role "user", and content text of at least 10 characters.
+        
+        Parameters:
+            file_path (Path): Path to the Claude Code JSONL log file to parse.
+        
+        Returns:
+            Iterator[ParsedPrompt]: ParsedPrompt objects containing id, source, content, project_path, session_id, timestamp, response, and turn_json for each user prompt found.
+        """
         project_name = file_path.parent.name
         session_id = file_path.stem
 
@@ -54,6 +64,18 @@ class ClaudeCodeParser(BaseParser):
         pending_turn_lines: list[dict[str, Any]] = []
 
         def extract_text(value: Any) -> Optional[str]:
+            """
+            Extract a normalized text string from a message content value.
+            
+            Parameters:
+                value (Any): A message content value which may be:
+                    - a string: returned trimmed if non-empty;
+                    - a list of dicts: collects items with "type" == "text" and concatenates their "text" fields with newline separators.
+                    Other types are ignored.
+            
+            Returns:
+                Optional[str]: The trimmed joined text if any meaningful text is found, otherwise `None`.
+            """
             if isinstance(value, str):
                 text = value.strip()
                 return text if text else None
@@ -72,6 +94,15 @@ class ClaudeCodeParser(BaseParser):
             return None
 
         def is_user_prompt(event: dict[str, Any]) -> Optional[str]:
+            """
+            Determine whether a parsed event contains a user message and, if so, return its extracted text.
+            
+            Parameters:
+                event (dict[str, Any]): A parsed JSON event object from a Claude Code log entry.
+            
+            Returns:
+                str: The user's message text if the event is a user-type message with role "user" and the extracted text is at least 10 characters long, `None` otherwise.
+            """
             if event.get("type") != "user":
                 return None
             msg = event.get("message") or {}
@@ -83,6 +114,17 @@ class ClaudeCodeParser(BaseParser):
             return None
 
         def extract_assistant_text(event: dict[str, Any]) -> list[str]:
+            """
+            Extract assistant-produced text fragments from an event object.
+            
+            Parameters:
+                event (dict): Event JSON object expected to represent an assistant message whose
+                    `"message"."content"` is a list of parts.
+            
+            Returns:
+                list[str]: A list of text strings extracted from content parts where each part is a
+                dict with `"type" == "text"` and the `"text"` field is a string longer than 5 characters.
+            """
             if event.get("type") != "assistant":
                 return []
             msg = event.get("message") or {}
@@ -103,6 +145,14 @@ class ClaudeCodeParser(BaseParser):
             return parts
 
         def flush_pending() -> Optional[ParsedPrompt]:
+            """
+            Finalize the currently accumulated prompt and reset the pending state.
+            
+            Assembles a ParsedPrompt from the pending content, timestamp, accumulated assistant response parts (joined with newlines), and the collected turn events (JSON-encoded), generates a prompt id, clears all pending_* variables, and returns the constructed ParsedPrompt.
+            
+            Returns:
+                ParsedPrompt or None: The assembled ParsedPrompt if there was pending content; `None` if no pending content existed.
+            """
             nonlocal pending_content, pending_ts_str, pending_timestamp, pending_response_parts, pending_turn_lines
             if pending_content is None:
                 return None
