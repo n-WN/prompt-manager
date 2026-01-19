@@ -11,6 +11,7 @@ from textual.widgets.option_list import Option
 from textual.binding import Binding
 from textual import on
 from textual.screen import ModalScreen
+from textual.timer import Timer
 
 from datetime import datetime
 from typing import Optional
@@ -309,13 +310,23 @@ class PromptDetailScreen(ModalScreen):
 
         turn_json = None
         if prompt_id:
+            conn = getattr(self.app, "conn", None)
+            created_conn = False
+            if conn is None:
+                conn = get_connection()
+                created_conn = True
             try:
-                conn = getattr(self.app, "conn", None) or get_connection()
                 full_prompt = get_prompt(conn, prompt_id)
                 if full_prompt:
                     turn_json = full_prompt.get("turn_json")
             except Exception:
                 turn_json = None
+            finally:
+                if created_conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
         ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S") if timestamp else "N/A"
         star_icon = "[yellow]*[/]" if starred else ""
@@ -354,15 +365,37 @@ class PromptDetailScreen(ModalScreen):
     def action_copy(self) -> None:
         try:
             pyperclip.copy(self.prompt["content"])
-            conn = get_connection()
-            increment_use_count(conn, self.prompt["id"])
+            conn = getattr(self.app, "conn", None)
+            created_conn = False
+            if conn is None:
+                conn = get_connection()
+                created_conn = True
+            try:
+                increment_use_count(conn, self.prompt["id"])
+            finally:
+                if created_conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             self.notify("Copied!", severity="information")
         except Exception as e:
             self.notify(f"Failed: {e}", severity="error")
 
     def action_star(self) -> None:
-        conn = get_connection()
-        new_status = toggle_star(conn, self.prompt["id"])
+        conn = getattr(self.app, "conn", None)
+        created_conn = False
+        if conn is None:
+            conn = get_connection()
+            created_conn = True
+        try:
+            new_status = toggle_star(conn, self.prompt["id"])
+        finally:
+            if created_conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         self.prompt["starred"] = new_status
         self.notify("Starred!" if new_status else "Unstarred")
         self.dismiss(True)  # Signal to refresh
@@ -646,6 +679,7 @@ class PromptManagerApp(App):
         self.prompts: list[dict] = []
         self.prompt_map: dict[str, dict] = {}  # id -> prompt
         self.selected_prompt: Optional[dict] = None
+        self._search_timer: Optional[Timer] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1071,6 +1105,19 @@ class PromptManagerApp(App):
     @on(Input.Changed, "#search-input")
     def on_search_changed(self, event: Input.Changed) -> None:
         self.search_query = event.value
+
+        if self._search_timer is not None:
+            try:
+                self._search_timer.stop()
+            except Exception:
+                pass
+            self._search_timer = None
+
+        # Debounce database scans while typing.
+        self._search_timer = self.set_timer(0.25, self._apply_search)
+
+    def _apply_search(self) -> None:
+        self._search_timer = None
         self.load_prompts()
         self.update_preview(None)
 

@@ -95,6 +95,7 @@ class GeminiCliParser(BaseParser):
                 j += 1
 
             response = "\n".join(response_parts) if response_parts else None
+            turn_json = json.dumps(messages[i:j], ensure_ascii=False)
 
             unique = msg.get("id") or ts_str
             prompt_id = self.generate_id(
@@ -112,7 +113,7 @@ class GeminiCliParser(BaseParser):
                 session_id=session_id,
                 timestamp=timestamp,
                 response=response,
+                turn_json=turn_json,
             )
 
             i += 1
-
