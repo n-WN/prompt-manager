@@ -84,10 +84,10 @@ def main():
             print(f"  Gemini CLI: {counts['gemini_cli']}")
 
     elif args.command == "search":
-        from .db import get_connection, search_prompts
+        from .db import get_connection, search_prompt_summaries
 
         conn = get_connection()
-        prompts = search_prompts(
+        prompts = search_prompt_summaries(
             conn,
             query=args.query,
             source=args.source,

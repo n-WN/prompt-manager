@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from . import BaseParser, ParsedPrompt
 
@@ -47,112 +47,84 @@ class ClaudeCodeParser(BaseParser):
         # Convert project name back to path
         project_path = "/" + project_name.replace("-", "/")
 
-        # Read all lines first
-        lines = []
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+        pending_content: Optional[str] = None
+        pending_ts_str: str = ""
+        pending_timestamp = None
+        pending_response_parts: list[str] = []
+        pending_turn_lines: list[dict[str, Any]] = []
+
+        def extract_text(value: Any) -> Optional[str]:
+            if isinstance(value, str):
+                text = value.strip()
+                return text if text else None
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") != "text":
+                        continue
+                    text = item.get("text", "")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+                joined = "\n".join(parts).strip()
+                return joined if joined else None
+            return None
+
+        def is_user_prompt(event: dict[str, Any]) -> Optional[str]:
+            if event.get("type") != "user":
+                return None
+            msg = event.get("message") or {}
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                return None
+            text = extract_text(msg.get("content"))
+            if text and len(text.strip()) >= 10:
+                return text
+            return None
+
+        def extract_assistant_text(event: dict[str, Any]) -> list[str]:
+            if event.get("type") != "assistant":
+                return []
+            msg = event.get("message") or {}
+            if not isinstance(msg, dict):
+                return []
+            content = msg.get("content")
+            if not isinstance(content, list):
+                return []
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
                     continue
-                try:
-                    data = json.loads(line)
-                    lines.append(data)
-                except json.JSONDecodeError:
+                if item.get("type") != "text":
                     continue
+                text = item.get("text", "")
+                if isinstance(text, str) and text and len(text) > 5:
+                    parts.append(text)
+            return parts
 
-        # Process user messages and find their responses
-        i = 0
-        while i < len(lines):
-            data = lines[i]
+        def flush_pending() -> Optional[ParsedPrompt]:
+            nonlocal pending_content, pending_ts_str, pending_timestamp, pending_response_parts, pending_turn_lines
+            if pending_content is None:
+                return None
 
-            # Only process user messages
-            if data.get("type") != "user":
-                i += 1
-                continue
-
-            message = data.get("message", {})
-            if message.get("role") != "user":
-                i += 1
-                continue
-
-            # Extract user content
-            content = message.get("content")
-            if not content:
-                i += 1
-                continue
-
-            # Handle array content (tool results)
-            if isinstance(content, list):
-                text_parts = [
-                    item.get("text", "")
-                    for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                ]
-                if not text_parts:
-                    i += 1
-                    continue
-                content = "\n".join(text_parts)
-
-            # Skip very short prompts
-            if len(content.strip()) < 10:
-                i += 1
-                continue
-
-            # Parse timestamp
-            ts_str = data.get("timestamp") or ""
-            timestamp = self.parse_timestamp(ts_str)
-
-            # Find assistant response (look ahead)
-            response = None
-            j = i + 1
-            while j < len(lines):
-                next_data = lines[j]
-                next_type = next_data.get("type")
-
-                # Stop if we hit another user message
-                if next_type == "user":
-                    next_msg = next_data.get("message", {})
-                    if next_msg.get("role") == "user":
-                        next_content = next_msg.get("content")
-                        # Check if it's actual user input (text blocks), not tool results
-                        next_text = None
-                        if isinstance(next_content, str):
-                            next_text = next_content
-                        elif isinstance(next_content, list):
-                            text_parts = [
-                                item.get("text", "")
-                                for item in next_content
-                                if isinstance(item, dict) and item.get("type") == "text"
-                            ]
-                            if text_parts:
-                                next_text = "\n".join(text_parts)
-
-                        if next_text and len(next_text.strip()) >= 10:
-                            break
-
-                # Extract assistant text response
-                if next_type == "assistant":
-                    next_msg = next_data.get("message", {})
-                    next_content = next_msg.get("content", [])
-                    if isinstance(next_content, list):
-                        for item in next_content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                text = item.get("text", "")
-                                if text and len(text) > 5:
-                                    if response:
-                                        response += "\n" + text
-                                    else:
-                                        response = text
-                j += 1
-
-            prompt_id = self.generate_id(
-                self.source_name,
-                content,
-                session_id,
-                ts_str or ""
+            content = pending_content
+            ts_str = pending_ts_str
+            timestamp = pending_timestamp
+            response = "\n".join(pending_response_parts) if pending_response_parts else None
+            turn_json = (
+                json.dumps(pending_turn_lines, ensure_ascii=False)
+                if pending_turn_lines
+                else None
             )
 
-            yield ParsedPrompt(
+            prompt_id = self.generate_id(self.source_name, content, session_id, ts_str or "")
+            pending_content = None
+            pending_ts_str = ""
+            pending_timestamp = None
+            pending_response_parts = []
+            pending_turn_lines = []
+
+            return ParsedPrompt(
                 id=prompt_id,
                 source=self.source_name,
                 content=content,
@@ -160,6 +132,40 @@ class ClaudeCodeParser(BaseParser):
                 session_id=session_id,
                 timestamp=timestamp,
                 response=response,
+                turn_json=turn_json,
             )
 
-            i += 1
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+
+                user_text = is_user_prompt(data)
+                if user_text is not None:
+                    flushed = flush_pending()
+                    if flushed is not None:
+                        yield flushed
+
+                    pending_content = user_text
+                    pending_ts_str = data.get("timestamp") or ""
+                    pending_timestamp = self.parse_timestamp(pending_ts_str)
+                    pending_response_parts = []
+                    pending_turn_lines = [data]
+                    continue
+
+                if pending_content is None:
+                    continue
+
+                pending_turn_lines.append(data)
+                pending_response_parts.extend(extract_assistant_text(data))
+
+        flushed = flush_pending()
+        if flushed is not None:
+            yield flushed

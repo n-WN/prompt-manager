@@ -65,6 +65,11 @@ class TestGeminiCliParser(unittest.TestCase):
             self.assertEqual(prompts[0].session_id, "sess1")
             self.assertEqual(prompts[0].content, "User prompt long enough")
             self.assertEqual(prompts[0].response, "First answer\nSecond answer")
+            self.assertIsNotNone(prompts[0].turn_json)
+            turn0 = json.loads(prompts[0].turn_json or "[]")
+            self.assertEqual([m.get("id") for m in turn0], ["m1", "m2", "m3"])
+            turn1 = json.loads(prompts[1].turn_json or "[]")
+            self.assertEqual([m.get("id") for m in turn1], ["m4", "m5"])
 
 
 class TestClaudeCodeParser(unittest.TestCase):
@@ -119,6 +124,14 @@ class TestClaudeCodeParser(unittest.TestCase):
             self.assertEqual(prompts[0].response, "First response")
             self.assertEqual(prompts[1].content, "Second prompt long enough")
             self.assertEqual(prompts[1].response, "Second response")
+            self.assertIsNotNone(prompts[0].turn_json)
+            self.assertIsNotNone(prompts[1].turn_json)
+            turn0 = json.loads(prompts[0].turn_json or "[]")
+            turn1 = json.loads(prompts[1].turn_json or "[]")
+            self.assertEqual(len(turn0), 2)
+            self.assertEqual(len(turn1), 2)
+            self.assertNotIn("Second prompt long enough", prompts[0].turn_json or "")
+            self.assertIn("Second prompt long enough", prompts[1].turn_json or "")
 
 
 class TestCodexParser(unittest.TestCase):
