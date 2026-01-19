@@ -101,6 +101,13 @@ def main():
             print(f"  Codex: {counts['codex']}")
             print(f"  Gemini CLI: {counts['gemini_cli']}")
             print(f"  Amp: {counts['amp']}")
+            print(
+                "Files:"
+                f" checked={counts.get('files_checked', 0)}"
+                f" updated={counts.get('files_updated', 0)}"
+                f" skipped={counts.get('files_skipped', 0)}"
+                f" failed={counts.get('files_failed', 0)}"
+            )
 
     elif args.command == "rebuild":
         from .db import get_connection
@@ -133,7 +140,9 @@ def main():
             progress_callback=on_progress,
             preserve_metadata=not args.no_preserve_metadata,
         )
-        print(f"Rebuilt database: {counts.get('total', 0)} prompts")
+        failed = int(counts.get("files_failed") or 0)
+        suffix = f" (failed {failed} files)" if failed else ""
+        print(f"Rebuilt database: {counts.get('total', 0)} prompts{suffix}")
 
     elif args.command == "search":
         from .db import get_connection, search_prompt_summaries

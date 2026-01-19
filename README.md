@@ -72,7 +72,7 @@ prompt-manager
 | `g` | Filter Gemini CLI |
 | `6` | Filter starred |
 | `s` | Sync new prompts |
-| `r` | Rebuild database (re-index logs) |
+| `r` | Rebuild database (force re-import) |
 | `ctrl+r` | Refresh view |
 | `c` / `y` | Copy selected prompt |
 | `f` | Fork session |
@@ -86,6 +86,11 @@ version (especially one that changes parsing or storage), rebuild the index so e
 
 - In the TUI: press `r` and confirm to rebuild
 - Or via CLI: `pm rebuild`
+
+Notes:
+- `s` is incremental sync (usually seconds; only changed files).
+- `r` is a full rebuild (can take minutes; clears and re-imports everything).
+- Seeing many `skipped` files during `s` is normal — it just means those logs didn't change.
 
 If startup becomes slow after upgrading, you may have an old / very large database (or a large `.wal` file).
 You can inspect and clean it with:

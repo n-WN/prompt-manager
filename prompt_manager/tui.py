@@ -12,6 +12,10 @@ from textual.binding import Binding
 from textual import on
 from textual.screen import ModalScreen
 from textual.timer import Timer
+try:
+    from textual.theme import Theme
+except Exception:  # pragma: no cover
+    Theme = None  # type: ignore[assignment]
 
 from datetime import datetime
 from typing import Optional
@@ -222,8 +226,15 @@ class SyncProgressScreen(ModalScreen):
             else:
                 items = f" | items={progress.file_items_done}"
 
-        reason = f": {progress.skip_reason}" if progress.skip_reason else ""
-        skipped = f" (skipped{reason})" if progress.skipped else ""
+        skipped = ""
+        if progress.skipped:
+            if progress.skip_reason == "up-to-date":
+                skipped = " (unchanged)"
+            elif progress.skip_reason == "missing":
+                skipped = " (missing)"
+            else:
+                reason = f": {progress.skip_reason}" if progress.skip_reason else ""
+                skipped = f" (skipped{reason})"
         error = f" [error: {progress.error}]" if progress.error else ""
 
         status = (
@@ -486,7 +497,7 @@ class PromptManagerApp(App):
 
     CSS = """
     Screen {
-        background: $surface;
+        background: $background;
     }
 
     #app-grid {
@@ -534,8 +545,8 @@ class PromptManagerApp(App):
 
     #stats-bar {
         height: 1;
-        background: $primary-darken-3;
-        color: $text-muted;
+        background: $panel;
+        color: $text;
         padding: 0 1;
         text-style: italic;
     }
@@ -739,6 +750,27 @@ class PromptManagerApp(App):
 
     def __init__(self):
         super().__init__()
+        if Theme is not None:
+            try:
+                self.register_theme(
+                    Theme(
+                        name="prompt-manager-gruvbox",
+                        primary="#83a598",
+                        secondary="#d3869b",
+                        accent="#fe8019",
+                        success="#b8bb26",
+                        warning="#fabd2f",
+                        error="#fb4934",
+                        foreground="#ebdbb2",
+                        background="#282828",
+                        surface="#32302f",
+                        panel="#3c3836",
+                        dark=True,
+                    )
+                )
+                self.theme = "prompt-manager-gruvbox"
+            except Exception:
+                pass
         self.conn = get_connection()
         self.current_filter: Optional[str] = None
         self.starred_only = False
@@ -856,12 +888,12 @@ class PromptManagerApp(App):
         tree.root.expand()
 
         source_icons = {
-            "claude_code": "[cyan]C[/]",
-            "cursor": "[magenta]Cu[/]",
-            "codex": "[green]Cx[/]",
-            "aider": "[yellow]A[/]",
-            "gemini_cli": "[blue]Gm[/]",
-            "amp": "[red]Am[/]",
+            "claude_code": "[#b8bb26]C[/]",
+            "cursor": "[#d3869b]Cu[/]",
+            "codex": "[#83a598]Cx[/]",
+            "aider": "[#fabd2f]A[/]",
+            "gemini_cli": "[#fe8019]Gm[/]",
+            "amp": "[#fb4934]Am[/]",
         }
         source_labels = {
             "claude_code": "Claude",
@@ -888,9 +920,7 @@ class PromptManagerApp(App):
             for project in sorted(grouped[source].keys()):
                 project_short = self._display_project_label(source, project)
                 project_count = sum(len(p) for p in grouped[source][project].values())
-                project_node = source_node.add(
-                    f"[blue]{project_short}[/] ({project_count})"
-                )
+                project_node = source_node.add(f"[#a89984]{project_short}[/] ({project_count})")
 
                 # Collect ALL prompts in this project for common prefix detection
                 all_project_prompts = []
@@ -1097,10 +1127,14 @@ class PromptManagerApp(App):
         self.update_stats()
         self.update_preview(None)
 
+        failed = int(counts.get("files_failed") or 0)
         if rebuild:
-            self.notify(f"Rebuilt database: {counts.get('total', 0)} prompts")
+            msg = f"Rebuilt database: {counts.get('total', 0)} prompts"
         else:
-            self.notify(f"Synced {counts.get('total', 0)} new prompts")
+            msg = f"Synced {counts.get('total', 0)} new prompts"
+        if failed:
+            msg += f" (failed {failed} files)"
+        self.notify(msg)
 
     def _on_sync_failed(self, screen: SyncProgressScreen, error: str) -> None:
         try:
