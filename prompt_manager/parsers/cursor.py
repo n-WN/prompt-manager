@@ -33,6 +33,7 @@ class CursorParser(BaseParser):
     """
 
     source_name = "cursor"
+    sync_version = 2
 
     def __init__(self, base_path: Optional[Path] = None):
         self.base_path = base_path or Path.home() / ".cursor" / "chats"
@@ -110,12 +111,10 @@ class CursorParser(BaseParser):
                 except (binascii.Error, json.JSONDecodeError, ValueError):
                     pass
 
-            # Parse ALL blobs and collect messages in order
-            cursor = conn.execute("SELECT id, data FROM blobs")
             messages: List[Tuple[str, str, str]] = []  # (role, content, blob_id)
-            seen_content: Set[str] = set()  # For deduplication
+            seen_content: Set[Tuple[str, str]] = set()  # (role, content_key)
 
-            for blob_id, blob_data in cursor:
+            for blob_id, blob_data in self._iter_legacy_blobs(conn):
                 if not isinstance(blob_data, bytes):
                     continue
 
@@ -133,13 +132,15 @@ class CursorParser(BaseParser):
                 if not role or not content:
                     continue
 
-                # Deduplicate based on content hash (first 200 chars)
+                # Deduplicate based on role + content hash (first 200 chars)
                 content_key = content[:200].strip()
-                if content_key in seen_content:
+                if (role, content_key) in seen_content:
                     continue
-                seen_content.add(content_key)
+                seen_content.add((role, content_key))
 
                 messages.append((role, content, blob_id))
+
+            self._infer_unknown_message_roles(messages)
 
             # Generate prompts: pair user messages with following assistant responses
             i = 0
@@ -157,23 +158,22 @@ class CursorParser(BaseParser):
                     i += 1
                     continue
 
-                # Look ahead for assistant response (skip tool messages)
-                response = None
+                response_parts: list[str] = []
+                turn_messages: list[dict[str, str]] = [{"role": role, "content": content, "blob_id": blob_id}]
+
                 j = i + 1
                 while j < len(messages):
-                    next_role, next_content, _ = messages[j]
-
+                    next_role, next_content, next_blob_id = messages[j]
                     if next_role == "user":
-                        # Hit next user message, stop looking
                         break
-
-                    if next_role == "assistant":
-                        # Found assistant response
-                        response = next_content
-                        break
-
-                    # Skip tool/system messages
+                    if next_role == "assistant" and next_content.strip():
+                        response_parts.append(next_content)
+                    turn_messages.append(
+                        {"role": next_role, "content": next_content, "blob_id": next_blob_id}
+                    )
                     j += 1
+
+                response = "\n".join(response_parts) if response_parts else None
 
                 prompt_id = self.generate_id(
                     self.source_name,
@@ -190,12 +190,40 @@ class CursorParser(BaseParser):
                     session_id=chat_id,
                     timestamp=created_at,
                     response=response,
+                    turn_json=json.dumps(turn_messages, ensure_ascii=False),
                 )
 
                 i += 1
 
         finally:
             conn.close()
+
+    def _iter_legacy_blobs(self, conn: sqlite3.Connection) -> Iterator[Tuple[str, bytes]]:
+        """Yield blobs in stable insertion order."""
+        try:
+            cursor = conn.execute("SELECT rowid, id, data FROM blobs ORDER BY rowid")
+        except sqlite3.Error:
+            cursor = conn.execute("SELECT id, data FROM blobs")
+            for blob_id, blob_data in cursor:
+                yield blob_id, blob_data
+            return
+
+        for _, blob_id, blob_data in cursor:
+            yield blob_id, blob_data
+
+    def _infer_unknown_message_roles(self, messages: List[Tuple[str, str, str]]) -> None:
+        """Fill in 'unknown' roles by alternating user/assistant turns."""
+        last_role: Optional[str] = None
+        for idx, (role, content, blob_id) in enumerate(messages):
+            if role in {"user", "assistant"}:
+                last_role = role
+                continue
+            if role != "unknown":
+                continue
+
+            inferred = "assistant" if last_role == "user" else "user"
+            messages[idx] = (inferred, content, blob_id)
+            last_role = inferred
 
     def _parse_state_vscdb(self, file_path: Path) -> Iterator[ParsedPrompt]:
         """Parse Cursor globalStorage DB (state.vscdb)."""
@@ -506,32 +534,33 @@ class CursorParser(BaseParser):
         if not strings:
             return None
 
-        # Look for patterns in the extracted strings
-        for field_num, text in strings:
-            # Field 4 often contains embedded JSON with role/content
-            if field_num == 4 and text.startswith("{"):
-                try:
-                    embedded = json.loads(text)
-                    if isinstance(embedded, dict):
-                        role = embedded.get("role")
-                        content = embedded.get("content")
-                        if role == "assistant" and content:
-                            extracted = self._extract_assistant_text(content)
-                            if extracted:
-                                return ("assistant", extracted)
-                        elif role == "user" and content:
-                            extracted = self._extract_text_content(content)
-                            if extracted:
-                                return ("user", extracted)
-                except json.JSONDecodeError:
-                    pass
+        for _, text in strings:
+            candidate = text.lstrip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                embedded = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(embedded, dict):
+                continue
 
-            # Field 1 might contain user message text (but only if no JSON found)
-            if field_num == 1 and len(text) > 20:
-                if not text.startswith(("file://", "http://", "https://", "{")):
-                    if any(c.isalpha() for c in text):
-                        return ("user", text)
+            role = embedded.get("role")
+            content = embedded.get("content")
+            if role == "assistant" and content:
+                extracted = self._extract_assistant_text(content)
+                if extracted:
+                    return ("assistant", extracted)
+            if role == "user" and content:
+                extracted = self._extract_text_content(content)
+                if extracted:
+                    return ("user", extracted)
+            if role == "tool":
+                return ("tool", "")
 
+        field1 = next((t for n, t in strings if n == 1 and t.strip()), None)
+        if field1:
+            return ("unknown", field1)
         return None
 
     def _parse_protobuf_strings(self, data: bytes) -> List[Tuple[int, str]]:

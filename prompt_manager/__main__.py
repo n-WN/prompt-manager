@@ -23,6 +23,14 @@ def main():
         help="Only sync from specific source"
     )
 
+    # Rebuild command
+    rebuild_parser = subparsers.add_parser("rebuild", help="Rebuild database (force re-import)")
+    rebuild_parser.add_argument(
+        "--no-preserve-metadata",
+        action="store_true",
+        help="Do not preserve starred/tags/use_count",
+    )
+
     # Search command
     search_parser = subparsers.add_parser("search", help="Search prompts")
     search_parser.add_argument("query", nargs="?", help="Search query")
@@ -82,6 +90,39 @@ def main():
             print(f"  Aider: {counts['aider']}")
             print(f"  Codex: {counts['codex']}")
             print(f"  Gemini CLI: {counts['gemini_cli']}")
+
+    elif args.command == "rebuild":
+        from .db import get_connection
+        from .sync import rebuild_database, SyncProgress
+
+        conn = get_connection()
+
+        last_line = ""
+
+        def on_progress(p: SyncProgress) -> None:
+            nonlocal last_line
+            if p.phase in {"starting", "resetting", "restoring"}:
+                line = p.phase
+            else:
+                suffix = ""
+                if p.phase == "syncing":
+                    if p.file_items_total is not None:
+                        suffix = f" | items={p.file_items_done}/{p.file_items_total}"
+                    else:
+                        suffix = f" | items={p.file_items_done}"
+                if p.skipped and p.skip_reason:
+                    suffix += f" | skipped={p.skip_reason}"
+                line = f"{p.phase} {p.files_checked}/{p.files_total} | updated={p.files_updated} | new={p.new_prompts_total}{suffix}"
+            if line != last_line:
+                print(line)
+                last_line = line
+
+        counts = rebuild_database(
+            conn,
+            progress_callback=on_progress,
+            preserve_metadata=not args.no_preserve_metadata,
+        )
+        print(f"Rebuilt database: {counts.get('total', 0)} prompts")
 
     elif args.command == "search":
         from .db import get_connection, search_prompt_summaries

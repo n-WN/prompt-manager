@@ -22,6 +22,7 @@ class ClaudeCodeParser(BaseParser):
     """
 
     source_name = "claude_code"
+    sync_version = 2
 
     def __init__(self, base_path: Optional[Path] = None):
         self.base_path = base_path or Path.home() / ".claude" / "projects"
@@ -45,13 +46,25 @@ class ClaudeCodeParser(BaseParser):
         session_id = file_path.stem
 
         # Convert project name back to path
-        project_path = "/" + project_name.replace("-", "/")
+        decoded = project_name.replace("-", "/")
+        project_path = decoded if decoded.startswith("/") else "/" + decoded
 
         pending_content: Optional[str] = None
         pending_ts_str: str = ""
         pending_timestamp = None
         pending_response_parts: list[str] = []
         pending_turn_lines: list[dict[str, Any]] = []
+
+        def is_local_command_transcript(text: str) -> bool:
+            markers = (
+                "<local-command-caveat>",
+                "<command-name>",
+                "<command-message>",
+                "<command-args>",
+                "<local-command-stdout>",
+                "<local-command-stderr>",
+            )
+            return any(marker in text for marker in markers)
 
         def extract_text(value: Any) -> Optional[str]:
             if isinstance(value, str):
@@ -74,10 +87,14 @@ class ClaudeCodeParser(BaseParser):
         def is_user_prompt(event: dict[str, Any]) -> Optional[str]:
             if event.get("type") != "user":
                 return None
+            if event.get("isMeta") is True:
+                return None
             msg = event.get("message") or {}
             if not isinstance(msg, dict) or msg.get("role") != "user":
                 return None
             text = extract_text(msg.get("content"))
+            if text and is_local_command_transcript(text):
+                return None
             if text and len(text.strip()) >= 10:
                 return text
             return None
@@ -89,6 +106,9 @@ class ClaudeCodeParser(BaseParser):
             if not isinstance(msg, dict):
                 return []
             content = msg.get("content")
+            if isinstance(content, str):
+                text = content.strip()
+                return [text] if len(text) > 5 else []
             if not isinstance(content, list):
                 return []
             parts: list[str] = []

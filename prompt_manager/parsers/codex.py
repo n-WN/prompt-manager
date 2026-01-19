@@ -34,6 +34,7 @@ class CodexParser(BaseParser):
     """
 
     source_name = "codex"
+    sync_version = 2
 
     def __init__(self, base_path: Optional[Path] = None):
         self.base_path = base_path or Path.home() / ".codex"

@@ -26,6 +26,10 @@ class BaseParser(ABC):
     """Base class for log parsers."""
 
     source_name: str = "unknown"
+    # Bump this when a parser's output schema changes (e.g. improved response
+    # extraction, new `turn_json` capture) so sync can re-process unchanged files
+    # once to backfill missing fields.
+    sync_version: int = 1
 
     @abstractmethod
     def find_log_files(self) -> Iterator[Path]:
