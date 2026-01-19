@@ -135,6 +135,11 @@ class SyncProgressScreen(ModalScreen):
         margin: 1 0;
     }
 
+    #sync-subprogress {
+        height: 1;
+        margin: 0 0 1 0;
+    }
+
     #sync-progress {
         height: 1;
     }
@@ -149,6 +154,7 @@ class SyncProgressScreen(ModalScreen):
             yield Label(self._title, id="sync-title")
             yield Rule()
             yield Static("", id="sync-status")
+            yield ProgressBar(total=1, show_percentage=False, show_eta=False, id="sync-subprogress")
             yield ProgressBar(total=1, id="sync-progress")
 
     def update_progress(self, progress: SyncProgress) -> None:
@@ -157,17 +163,34 @@ class SyncProgressScreen(ModalScreen):
             total=total, progress=min(progress.files_checked, total)
         )
 
+        sub_bar = self.query_one("#sync-subprogress", ProgressBar)
+        if progress.phase == "syncing" and not progress.skipped:
+            if progress.file_items_total:
+                sub_bar.update(total=max(int(progress.file_items_total), 1), progress=progress.file_items_done)
+            else:
+                sub_bar.update(total=None)
+        else:
+            sub_bar.update(total=1, progress=0)
+
         file_label = ""
         if progress.file_path and str(progress.file_path) not in {".", ""}:
             file_label = str(progress.file_path)
 
         phase = progress.phase
-        skipped = " (skipped)" if progress.skipped else ""
+        items = ""
+        if progress.file_items_done:
+            if progress.file_items_total:
+                items = f" | items={progress.file_items_done}/{progress.file_items_total}"
+            else:
+                items = f" | items={progress.file_items_done}"
+
+        reason = f": {progress.skip_reason}" if progress.skip_reason else ""
+        skipped = f" (skipped{reason})" if progress.skipped else ""
         error = f" [error: {progress.error}]" if progress.error else ""
 
         status = (
             f"{phase} | {progress.files_checked}/{progress.files_total} files | "
-            f"updated={progress.files_updated} | new_prompts={progress.new_prompts_total}"
+            f"updated={progress.files_updated} | new_prompts={progress.new_prompts_total}{items}"
         )
         if progress.source:
             status += f" | source={progress.source}"
@@ -1207,25 +1230,32 @@ class PromptManagerApp(App):
         project = self.selected_prompt.get("project_path") or ""
         session_id = self.selected_prompt.get("session_id") or ""
 
+        def resolve_work_dir(project_path: str) -> str:
+            if project_path.startswith("cursor:"):
+                candidate = project_path.split(":", 1)[1]
+                if os.path.isdir(candidate):
+                    return candidate
+            return project_path if os.path.isdir(project_path) else os.path.expanduser("~")
+
         # Determine working directory and command
         if source == "claude_code":
             # Claude Code: use --resume with --fork-session
-            work_dir = project if project.startswith("/") else os.path.expanduser("~")
+            work_dir = resolve_work_dir(project)
             if session_id:
                 cmd = ["claude", "--resume", session_id, "--fork-session"]
             else:
                 cmd = ["claude"]
         elif source == "codex":
             # Codex: fork the saved session (Codex CLI supports `codex fork <SESSION_ID>`)
-            work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
+            work_dir = resolve_work_dir(project)
             cmd = ["codex", "fork", session_id] if session_id else ["codex"]
         elif source == "aider":
             # Aider: launch in project directory if available
-            work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
+            work_dir = resolve_work_dir(project)
             cmd = ["aider"]
         elif source == "cursor":
             # Cursor: open in project directory when available
-            work_dir = project if os.path.isdir(project) else os.path.expanduser("~")
+            work_dir = resolve_work_dir(project)
             cmd = ["cursor", "."]
         elif source == "gemini_cli":
             # Gemini CLI: start a new session (no reliable resume command inferred)
@@ -1271,16 +1301,33 @@ class PromptManagerApp(App):
         def applescript_string(text: str) -> str:
             return text.replace("\\", "\\\\").replace('"', '\\"')
 
+        def popen_detached(argv: list[str]) -> None:
+            kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            try:
+                subprocess.Popen(argv, start_new_session=True, **kwargs)
+            except TypeError:
+                subprocess.Popen(argv, **kwargs)
+
         shell_cmd = f"cd {shlex.quote(work_dir)} && {shell_join(cmd)}"
 
         # If we're inside tmux, prefer opening a new tmux window/tab.
         if os.environ.get("TMUX") and shutil.which("tmux"):
-            subprocess.Popen(["tmux", "new-window", "-c", work_dir, shell_cmd])
+            popen_detached(["tmux", "new-window", "-c", work_dir, shell_cmd])
             return
 
         system = platform.system()
         if system == "Darwin":
             term_program = os.environ.get("TERM_PROGRAM", "")
+            if term_program and term_program not in {"Apple_Terminal", "iTerm.app"}:
+                direct = [
+                    ("wezterm", ["wezterm", "start", "--cwd", work_dir, "--", *cmd]),
+                    ("kitty", ["kitty", "--directory", work_dir, *cmd]),
+                    ("alacritty", ["alacritty", "--working-directory", work_dir, "-e", *cmd]),
+                ]
+                for exe, term_cmd in direct:
+                    if shutil.which(exe):
+                        popen_detached(term_cmd)
+                        return
             if term_program == "iTerm.app":
                 script = f'''
                 tell application "iTerm"
@@ -1298,7 +1345,7 @@ class PromptManagerApp(App):
                     do script "{applescript_string(shell_cmd)}"
                 end tell
                 '''
-            subprocess.Popen(["osascript", "-e", script])
+            popen_detached(["osascript", "-e", script])
             return
 
         if system == "Linux":
@@ -1310,7 +1357,7 @@ class PromptManagerApp(App):
             ]
             for exe, term_cmd in direct:
                 if shutil.which(exe):
-                    subprocess.Popen(term_cmd)
+                    popen_detached(term_cmd)
                     return
 
             # Fallback to terminals that require a shell string.
@@ -1323,7 +1370,7 @@ class PromptManagerApp(App):
             ]
             for exe, term_cmd in candidates:
                 if shutil.which(exe):
-                    subprocess.Popen(term_cmd)
+                    popen_detached(term_cmd)
                     return
             raise RuntimeError("No supported terminal found")
 

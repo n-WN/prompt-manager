@@ -5,6 +5,7 @@ from __future__ import annotations
 import duckdb
 from pathlib import Path
 from dataclasses import dataclass
+import time
 from typing import Callable, Optional
 
 from .db import get_connection, insert_prompt
@@ -25,7 +26,10 @@ class SyncProgress:
     files_updated: int
     new_prompts_total: int
     new_prompts_in_file: int
+    file_items_done: int = 0
+    file_items_total: Optional[int] = None
     skipped: bool = False
+    skip_reason: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -40,57 +44,102 @@ def _init_file_state_table(conn: duckdb.DuckDBPyConnection) -> None:
             source VARCHAR NOT NULL,
             file_size BIGINT,
             mtime DOUBLE,
+            sync_version INTEGER DEFAULT 1,
             last_sync TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info('file_sync_state')").fetchall()}
+    except Exception:
+        return
+
+    if "sync_version" not in columns:
+        try:
+            conn.execute("ALTER TABLE file_sync_state ADD COLUMN sync_version INTEGER DEFAULT 1")
+        except Exception:
+            return
+
+    conn.execute("UPDATE file_sync_state SET sync_version = 1 WHERE sync_version IS NULL")
 
 
 def _get_file_state(conn: duckdb.DuckDBPyConnection, file_path: str) -> Optional[dict]:
     """Get the stored state for a file."""
     result = conn.execute("""
-        SELECT file_size, mtime, last_sync FROM file_sync_state WHERE file_path = ?
+        SELECT file_size, mtime, sync_version, last_sync
+        FROM file_sync_state
+        WHERE file_path = ?
     """, [file_path]).fetchone()
     if result:
-        return {"file_size": result[0], "mtime": result[1], "last_sync": result[2]}
+        return {"file_size": result[0], "mtime": result[1], "sync_version": result[2], "last_sync": result[3]}
     return None
 
 
-def _update_file_state(conn: duckdb.DuckDBPyConnection, file_path: str, source: str, file_size: int, mtime: float) -> None:
+def _update_file_state(
+    conn: duckdb.DuckDBPyConnection,
+    file_path: str,
+    source: str,
+    file_size: int,
+    mtime: float,
+    sync_version: int,
+) -> None:
     """Update the stored state for a file."""
     conn.execute("""
-        INSERT INTO file_sync_state (file_path, source, file_size, mtime, last_sync)
-        VALUES (?, ?, ?, ?, NOW())
+        INSERT INTO file_sync_state (file_path, source, file_size, mtime, sync_version, last_sync)
+        VALUES (?, ?, ?, ?, ?, NOW())
         ON CONFLICT (file_path) DO UPDATE SET
             file_size = EXCLUDED.file_size,
             mtime = EXCLUDED.mtime,
+            sync_version = EXCLUDED.sync_version,
             last_sync = NOW()
-    """, [file_path, source, file_size, mtime])
+    """, [file_path, source, file_size, mtime, sync_version])
 
 
-def _file_needs_sync(conn: duckdb.DuckDBPyConnection, file_path: Path) -> bool:
-    """Check if a file needs to be synced based on size/mtime changes."""
+def _file_sync_status(
+    conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path: Path
+) -> tuple[bool, Optional[str]]:
+    """Return (needs_sync, reason) for a file."""
     try:
         stat = file_path.stat()
         current_size = stat.st_size
         current_mtime = stat.st_mtime
     except OSError:
-        return False
+        return False, "missing"
 
     state = _get_file_state(conn, str(file_path))
     if state is None:
-        return True  # Never synced
+        return True, "new"
+
+    stored_version = int(state.get("sync_version") or 1)
+    parser_version = int(getattr(parser, "sync_version", 1) or 1)
+    if stored_version != parser_version:
+        return True, f"parser v{stored_version}→{parser_version}"
 
     # Check if file changed (size or mtime different)
-    return state["file_size"] != current_size or abs(state["mtime"] - current_mtime) > 0.001
+    if state["file_size"] != current_size or abs(state["mtime"] - current_mtime) > 0.001:
+        return True, "modified"
+    return False, "up-to-date"
 
 
-def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path: Path) -> int:
+def _file_needs_sync(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path: Path) -> bool:
+    needs_sync, _ = _file_sync_status(conn, parser, file_path)
+    return needs_sync
+
+
+def _sync_file(
+    conn: duckdb.DuckDBPyConnection,
+    parser: "BaseParser",
+    file_path: Path,
+    *,
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> int:
     """Sync a single file and return number of prompts inserted.
 
     Returns:
         Number of new prompts inserted, or -1 on error
     """
     count = 0
+    items_done = 0
+    last_emit = 0.0
     backfill_rows: list[tuple[str, Optional[str], Optional[str]]] = []
     try:
         # DuckDB autocommits each statement by default, which becomes extremely slow
@@ -98,6 +147,7 @@ def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path:
         # sync in a single transaction so we pay fsync/commit cost once per file.
         conn.execute("BEGIN")
         for prompt in parser.parse_file(file_path):
+            items_done += 1
             inserted = insert_prompt(
                 conn,
                 id=prompt.id,
@@ -124,6 +174,12 @@ def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path:
                 if needs_response or needs_turn_json:
                     backfill_rows.append((prompt.id, prompt.response, prompt.turn_json))
 
+            if progress:
+                now = time.monotonic()
+                if items_done == 1 or (now - last_emit) > 0.2:
+                    progress(items_done, count)
+                    last_emit = now
+
         if backfill_rows:
             conn.execute("DROP TABLE IF EXISTS tmp_backfill")
             conn.execute("CREATE TEMP TABLE tmp_backfill(id VARCHAR, response TEXT, turn_json TEXT)")
@@ -143,8 +199,17 @@ def _sync_file(conn: duckdb.DuckDBPyConnection, parser: "BaseParser", file_path:
 
         # Update file state after successful parse
         stat = file_path.stat()
-        _update_file_state(conn, str(file_path), parser.source_name, stat.st_size, stat.st_mtime)
+        _update_file_state(
+            conn,
+            str(file_path),
+            parser.source_name,
+            stat.st_size,
+            stat.st_mtime,
+            int(getattr(parser, "sync_version", 1) or 1),
+        )
         conn.execute("COMMIT")
+        if progress:
+            progress(items_done, count)
         return count
 
     except Exception as e:
@@ -225,6 +290,10 @@ def sync_all(
     for idx, (parser, file_path) in enumerate(file_jobs, 1):
         counts["files_checked"] = idx
 
+        needs_sync, reason = _file_sync_status(conn, parser, file_path)
+        if force:
+            needs_sync, reason = True, "forced"
+
         if progress_callback:
             progress_callback(
                 SyncProgress(
@@ -236,17 +305,52 @@ def sync_all(
                     files_updated=counts["files_updated"],
                     new_prompts_total=counts["total"],
                     new_prompts_in_file=0,
+                    skip_reason=reason,
                 )
             )
 
-        needs_sync = force or _file_needs_sync(conn, file_path)
         inserted_in_file = 0
         skipped = not needs_sync
         error: Optional[str] = None
 
         if needs_sync:
             counts["files_updated"] += 1
-            result = _sync_file(conn, parser, file_path)
+
+            if progress_callback:
+                progress_callback(
+                    SyncProgress(
+                        phase="syncing",
+                        source=parser.source_name,
+                        file_path=file_path,
+                        files_checked=idx,
+                        files_total=files_total,
+                        files_updated=counts["files_updated"],
+                        new_prompts_total=counts["total"],
+                        new_prompts_in_file=0,
+                        file_items_done=0,
+                        skipped=False,
+                    )
+                )
+
+            def emit_file_progress(items_done: int, inserted_so_far: int) -> None:
+                if not progress_callback:
+                    return
+                progress_callback(
+                    SyncProgress(
+                        phase="syncing",
+                        source=parser.source_name,
+                        file_path=file_path,
+                        files_checked=idx,
+                        files_total=files_total,
+                        files_updated=counts["files_updated"],
+                        new_prompts_total=counts["total"],
+                        new_prompts_in_file=inserted_so_far,
+                        file_items_done=items_done,
+                        skipped=False,
+                    )
+                )
+
+            result = _sync_file(conn, parser, file_path, progress=emit_file_progress)
             if result >= 0:
                 inserted_in_file = result
                 counts[parser.source_name] = counts.get(parser.source_name, 0) + result
@@ -266,6 +370,7 @@ def sync_all(
                     new_prompts_total=counts["total"],
                     new_prompts_in_file=inserted_in_file,
                     skipped=skipped,
+                    skip_reason=reason,
                     error=error,
                 )
             )
@@ -380,7 +485,7 @@ def sync_source(source: str, conn: Optional[duckdb.DuckDBPyConnection] = None, f
     count = 0
 
     for file_path in parser.find_log_files():
-        if not force and not _file_needs_sync(conn, file_path):
+        if not force and not _file_needs_sync(conn, parser, file_path):
             continue
 
         result = _sync_file(conn, parser, file_path)
@@ -419,7 +524,7 @@ def check_updates(conn: Optional[duckdb.DuckDBPyConnection] = None) -> dict:
 
     for parser in parsers:
         for file_path in parser.find_log_files():
-            if _file_needs_sync(conn, file_path):
+            if _file_needs_sync(conn, parser, file_path):
                 updates[parser.source_name] += 1
 
     return updates

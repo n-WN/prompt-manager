@@ -133,6 +133,55 @@ class TestClaudeCodeParser(unittest.TestCase):
             self.assertNotIn("Second prompt long enough", prompts[0].turn_json or "")
             self.assertIn("Second prompt long enough", prompts[1].turn_json or "")
 
+    def test_filters_local_command_transcripts_and_decodes_project_path(self) -> None:
+        parser = ClaudeCodeParser()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "-Users-test-project"
+            log_dir.mkdir(parents=True)
+            log_path = log_dir / "session.jsonl"
+
+            lines = [
+                {
+                    "type": "user",
+                    "isMeta": True,
+                    "message": {
+                        "role": "user",
+                        "content": "<local-command-caveat>ignore</local-command-caveat>",
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "<command-name>ls</command-name>",
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "Actual prompt long enough",
+                    },
+                    "timestamp": "2025-10-14T12:00:00.000Z",
+                    "sessionId": "s",
+                    "cwd": "/tmp",
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": "Assistant response",
+                    },
+                },
+            ]
+            log_path.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+            prompts = list(parser.parse_file(log_path))
+            self.assertEqual(len(prompts), 1)
+            self.assertEqual(prompts[0].content, "Actual prompt long enough")
+            self.assertEqual(prompts[0].response, "Assistant response")
+            self.assertFalse((prompts[0].project_path or "").startswith("//"))
+
 
 class TestCodexParser(unittest.TestCase):
     def test_parses_short_user_messages_and_preserves_turn_timeline(self) -> None:
@@ -287,3 +336,63 @@ class TestCursorStateVscdbParser(unittest.TestCase):
             self.assertTrue((prompt.project_path or "").startswith("cursor:"))
             self.assertEqual(prompt.content, "User prompt long enough")
             self.assertEqual(prompt.response, "Assistant reply\nMore reply")
+
+
+class TestCursorLegacyStoreDbParser(unittest.TestCase):
+    def test_inferrs_unknown_roles_and_builds_turn_json(self) -> None:
+        parser = CursorParser()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "store.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+                conn.execute("CREATE TABLE blobs (id TEXT, data BLOB)")
+
+                meta = {"name": "Chat", "createdAt": "2025-10-14T12:00:00.000Z"}
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)",
+                    ("meta", json.dumps(meta).encode("utf-8").hex()),
+                )
+
+                def enc_varint(n: int) -> bytes:
+                    out = bytearray()
+                    while True:
+                        b = n & 0x7F
+                        n >>= 7
+                        if n:
+                            out.append(b | 0x80)
+                        else:
+                            out.append(b)
+                            break
+                    return bytes(out)
+
+                def pb_string(field_num: int, text: str) -> bytes:
+                    tag = (field_num << 3) | 2
+                    raw = text.encode("utf-8")
+                    return bytes([tag]) + enc_varint(len(raw)) + raw
+
+                def pb_text_message(text: str, msg_id: str) -> bytes:
+                    return pb_string(1, text) + pb_string(2, msg_id)
+
+                blobs = [
+                    ("b1", pb_text_message("User prompt long enough", "id1")),
+                    ("b2", pb_text_message("Assistant response", "id2")),
+                    ("b3", pb_text_message("Second user prompt long enough", "id3")),
+                    ("b4", pb_text_message("Second assistant response", "id4")),
+                ]
+                conn.executemany("INSERT INTO blobs (id, data) VALUES (?, ?)", blobs)
+                conn.commit()
+            finally:
+                conn.close()
+
+            prompts = list(parser.parse_file(db_path))
+            self.assertEqual(len(prompts), 2)
+            self.assertEqual(prompts[0].content, "User prompt long enough")
+            self.assertEqual(prompts[0].response, "Assistant response")
+            self.assertEqual(prompts[1].content, "Second user prompt long enough")
+            self.assertEqual(prompts[1].response, "Second assistant response")
+
+            self.assertIsNotNone(prompts[0].turn_json)
+            turn0 = json.loads(prompts[0].turn_json or "[]")
+            self.assertEqual([m.get("blob_id") for m in turn0], ["b1", "b2"])
