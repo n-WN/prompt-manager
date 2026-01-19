@@ -54,6 +54,9 @@ def main():
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Show statistics")
 
+    # Database info / diagnostics
+    db_info_parser = subparsers.add_parser("db-info", help="Show database file sizes and status")
+
     # Codex transcript (from rollout jsonl)
     codex_transcript_parser = subparsers.add_parser(
         "codex-transcript",
@@ -165,6 +168,84 @@ def main():
         print(f"  Gemini CLI:     {stats['gemini_cli']}")
         print(f"Starred:          {stats['starred']}")
         print(f"Total uses:       {stats['total_uses']}")
+
+    elif args.command == "db-info":
+        import os
+        import duckdb
+
+        from .db import get_db_path, get_default_db_path, get_recovered_db_path
+        from .db import get_stats
+
+        def fmt_bytes(n: int) -> str:
+            units = ["B", "KiB", "MiB", "GiB", "TiB"]
+            v = float(n)
+            for u in units:
+                if v < 1024.0 or u == units[-1]:
+                    if u == "B":
+                        return f"{int(v)} {u}"
+                    return f"{v:.1f} {u}"
+                v /= 1024.0
+            return f"{n} B"
+
+        def file_size(path: str) -> int:
+            try:
+                return os.path.getsize(path)
+            except OSError:
+                return 0
+
+        default_path = get_default_db_path()
+        recovered_path = get_recovered_db_path(default_path)
+        active_path = get_db_path()
+
+        candidates = []
+        if os.environ.get("PROMPT_MANAGER_DB_PATH"):
+            candidates.append(("active", active_path))
+        else:
+            candidates.append(("default", default_path))
+            candidates.append(("recovered", recovered_path))
+            if active_path not in {default_path, recovered_path}:
+                candidates.append(("active", active_path))
+
+        print("Prompt Manager DB Info")
+        print("=" * 40)
+        print(f"Active DB: {active_path}")
+        print("")
+
+        for label, path in candidates:
+            db_file = str(path)
+            wal_file = f"{db_file}.wal"
+            db_bytes = file_size(db_file)
+            wal_bytes = file_size(wal_file)
+            exists = os.path.exists(db_file)
+            print(f"[{label}] {db_file}{'' if exists else ' (missing)'}")
+            if exists:
+                print(f"  size: {fmt_bytes(db_bytes)}")
+            if wal_bytes:
+                print(f"  wal:  {fmt_bytes(wal_bytes)}")
+            print("")
+
+        # Try to query stats (best-effort; avoid creating new files).
+        if os.path.exists(str(active_path)):
+            try:
+                conn = duckdb.connect(str(active_path), read_only=True)
+            except Exception as e:
+                print(f"Failed to open active DB read-only: {e}")
+            else:
+                try:
+                    stats = get_stats(conn)
+                    print("Row counts")
+                    print(f"  total:      {stats['total']}")
+                    print(f"  claude:     {stats['claude_code']}")
+                    print(f"  cursor:     {stats['cursor']}")
+                    print(f"  aider:      {stats['aider']}")
+                    print(f"  codex:      {stats['codex']}")
+                    print(f"  gemini:     {stats['gemini_cli']}")
+                    print(f"  starred:    {stats['starred']}")
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
     elif args.command == "codex-transcript":
         from .codex_transcript import format_codex_rollout_transcript

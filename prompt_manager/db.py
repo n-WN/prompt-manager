@@ -1,17 +1,67 @@
 """DuckDB database operations for prompt storage."""
 
 import duckdb
+import os
+import sys
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
-DB_PATH = Path.home() / ".prompt-manager" / "prompts.duckdb"
+_DEFAULT_DB_PATH = Path.home() / ".prompt-manager" / "prompts.duckdb"
+
+def get_default_db_path() -> Path:
+    return _DEFAULT_DB_PATH
+
+
+def get_db_path() -> Path:
+    """Return the configured database path.
+
+    Supports overriding via `PROMPT_MANAGER_DB_PATH`.
+    """
+    env = os.environ.get("PROMPT_MANAGER_DB_PATH")
+    if env:
+        return Path(env).expanduser()
+    return _DEFAULT_DB_PATH
+
+
+def _recovered_db_path(db_path: Path) -> Path:
+    return db_path.with_name(f"{db_path.stem}.recovered{db_path.suffix}")
+
+
+def get_recovered_db_path(db_path: Optional[Path] = None) -> Path:
+    return _recovered_db_path(db_path or get_default_db_path())
+
+
+def _is_wal_replay_error(error: Exception) -> bool:
+    msg = str(error)
+    return "Failure while replaying WAL file" in msg
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Get a DuckDB connection, creating the database if needed."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(DB_PATH))
+    db_path = get_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        conn = duckdb.connect(str(db_path))
+    except Exception as exc:
+        if os.environ.get("PROMPT_MANAGER_DB_PATH") is None and _is_wal_replay_error(exc):
+            recovered = _recovered_db_path(db_path)
+            print(
+                (
+                    "WARNING: DuckDB failed to replay the WAL for the prompt-manager database.\n"
+                    f"  db:  {db_path}\n"
+                    f"  wal: {db_path}.wal\n"
+                    "Falling back to a recovered database file:\n"
+                    f"  db:  {recovered}\n"
+                    "Run `pm rebuild` to re-import logs into the recovered database."
+                ),
+                file=sys.stderr,
+            )
+            conn = duckdb.connect(str(recovered))
+        else:
+            raise
+
     _init_schema(conn)
     return conn
 

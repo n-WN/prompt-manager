@@ -255,6 +255,11 @@ def _sync_file(
             int(getattr(parser, "sync_version", 1) or 1),
         )
         conn.execute("COMMIT")
+        if parser.source_name == "codex" or file_size >= 20 * 1024 * 1024:
+            try:
+                conn.execute("CHECKPOINT")
+            except Exception:
+                pass
         if progress:
             progress(items_done, count)
         return count
@@ -532,6 +537,29 @@ def rebuild_database(
                 conn.execute(f"DROP TABLE IF EXISTS {preserved_table}")
             except Exception:
                 pass
+
+    if progress_callback:
+        progress_callback(
+            SyncProgress(
+                phase="compacting",
+                source="",
+                file_path=Path(),
+                files_checked=counts.get("files_checked", 0),
+                files_total=counts.get("files_checked", 0),
+                files_updated=counts.get("files_updated", 0),
+                new_prompts_total=counts.get("total", 0),
+                new_prompts_in_file=0,
+            )
+        )
+
+    try:
+        conn.execute("CHECKPOINT")
+    except Exception:
+        pass
+    try:
+        conn.execute("VACUUM")
+    except Exception:
+        pass
 
     return counts
 
