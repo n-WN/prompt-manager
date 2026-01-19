@@ -132,9 +132,7 @@ class CodexParser(BaseParser):
                 pending_response_parts = []
                 pending_has_structured_response = False
                 pending_turn_start = carryover_start if carryover_start is not None else line.offset_start
-                pending_turn_end = carryover_end if carryover_end is not None else line.offset_end
-                if line.offset_end is not None:
-                    pending_turn_end = line.offset_end
+                pending_turn_end = line.offset_end if line.offset_end is not None else carryover_end
                 carryover_start = None
                 carryover_end = None
                 continue

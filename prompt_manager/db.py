@@ -61,9 +61,18 @@ def _decompress_text(blob: bytes) -> Optional[str]:
 
 def _load_jsonl_range_as_array(path: str, start: int, end: int) -> Optional[str]:
     try:
+        start_i = int(start)
+        end_i = int(end)
+    except Exception:
+        return None
+
+    if start_i < 0 or end_i <= start_i:
+        return None
+
+    try:
         with open(path, "rb") as f:
-            f.seek(int(start))
-            chunk = f.read(int(end) - int(start))
+            f.seek(start_i)
+            chunk = f.read(end_i - start_i)
     except Exception:
         return None
 
