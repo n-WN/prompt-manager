@@ -31,6 +31,7 @@ from .db import (
     get_stats,
     increment_use_count,
     search_prompt_summaries,
+    search_prompt_summaries_balanced,
     toggle_star,
 )
 from .codex_transcript import format_codex_turn_json
@@ -325,7 +326,8 @@ class HelpScreen(ModalScreen):
 - `g` Filter Gemini CLI
 - `6` Starred only
 - `s` Sync new prompts
-- `r` Refresh view
+- `r` Rebuild database (re-index)
+- `ctrl+r` Refresh view
 - `c`/`y` Copy selected prompt
 - `f` Fork (launch agent)
 - `Enter` View full detail
@@ -705,7 +707,8 @@ class PromptManagerApp(App):
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("r", "refresh", "Refresh"),
+        Binding("r", "rebuild", "Rebuild"),
+        Binding("ctrl+r", "refresh", "Refresh"),
         Binding("s", "sync", "Sync"),
         Binding("/", "focus_search", "Search"),
         Binding("ctrl+p", "command_palette", "Commands"),
@@ -774,13 +777,25 @@ class PromptManagerApp(App):
 
     def load_prompts(self) -> None:
         """Load prompts and build tree by session."""
-        self.prompts = search_prompt_summaries(
-            self.conn,
-            query=self.search_query if self.search_query else None,
-            source=self.current_filter,
-            starred_only=self.starred_only,
-            limit=1000,
-        )
+        query = (self.search_query or "").strip() or None
+
+        if self.current_filter is None and not self.starred_only and query is None:
+            sources = ["claude_code", "cursor", "aider", "codex", "gemini_cli"]
+            per_source = max(50, 1000 // max(len(sources), 1))
+            self.prompts = search_prompt_summaries_balanced(
+                self.conn,
+                sources=sources,
+                per_source_limit=per_source,
+                snippet_len=400,
+            )
+        else:
+            self.prompts = search_prompt_summaries(
+                self.conn,
+                query=query,
+                source=self.current_filter,
+                starred_only=self.starred_only,
+                limit=1000,
+            )
 
         # Build prompt map
         self.prompt_map = {p["id"]: p for p in self.prompts}

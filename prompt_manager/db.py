@@ -396,6 +396,43 @@ def search_prompt_summaries(
     return [dict(zip(columns, row)) for row in result]
 
 
+def search_prompt_summaries_balanced(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    sources: list[str],
+    per_source_limit: int,
+    snippet_len: int = 400,
+) -> list[dict]:
+    """Fetch a balanced sample of recent prompts across sources.
+
+    The TUI "All" view loads a limited number of prompts for performance.
+    When one source dominates recent timestamps, other sources can disappear
+    entirely. This helper fetches up to `per_source_limit` rows per source and
+    merges them into a single list.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    for source in sources:
+        rows = search_prompt_summaries(
+            conn,
+            query=None,
+            source=source,
+            starred_only=False,
+            limit=per_source_limit,
+            offset=0,
+            snippet_len=snippet_len,
+        )
+        for row in rows:
+            prompt_id = row.get("id")
+            if not prompt_id or prompt_id in seen:
+                continue
+            seen.add(prompt_id)
+            out.append(row)
+
+    return out
+
+
 def search_prompts(
     conn: duckdb.DuckDBPyConnection,
     query: Optional[str] = None,

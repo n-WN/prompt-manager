@@ -70,11 +70,27 @@ prompt-manager
 | `g` | Filter Gemini CLI |
 | `6` | Filter starred |
 | `s` | Sync new prompts |
-| `r` | Refresh view |
+| `r` | Rebuild database (re-index logs) |
+| `ctrl+r` | Refresh view |
 | `c` / `y` | Copy selected prompt |
 | `f` | Fork session |
 | `Enter` | View full detail |
 | `q` | Quit |
+
+## Upgrading
+
+Prompt Manager keeps a local DuckDB index at `~/.prompt-manager/prompts.duckdb`. When you upgrade to a newer
+version (especially one that changes parsing or storage), rebuild the index so existing logs are re-imported:
+
+- In the TUI: press `r` and confirm to rebuild
+- Or via CLI: `pm rebuild`
+
+If startup becomes slow after upgrading, you may have an old / very large database (or a large `.wal` file).
+You can inspect and clean it with:
+
+- `pm db-info`
+- `pm db-clean` (dry-run)
+- `pm db-clean --yes` (delete old DB/WAL in `~/.prompt-manager`)
 
 ## Data Storage
 

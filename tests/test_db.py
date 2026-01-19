@@ -1,8 +1,15 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 
 import duckdb
 
-from prompt_manager.db import _init_schema, get_prompt, insert_prompt, search_prompt_summaries
+from prompt_manager.db import (
+    _init_schema,
+    get_prompt,
+    insert_prompt,
+    search_prompt_summaries,
+    search_prompt_summaries_balanced,
+)
 
 
 class TestDuckDbSchema(unittest.TestCase):
@@ -53,6 +60,60 @@ class TestDuckDbSchema(unittest.TestCase):
             self.assertEqual(rows[0]["id"], "p1")
             self.assertLessEqual(len(rows[0]["content"]), 5)
             self.assertNotIn("response", rows[0])
+        finally:
+            conn.close()
+
+    def test_balanced_summaries_include_each_source(self) -> None:
+        conn = duckdb.connect(":memory:")
+        try:
+            _init_schema(conn)
+            now = datetime.now(tz=timezone.utc)
+
+            # Many codex rows dominate recency.
+            for idx in range(200):
+                insert_prompt(
+                    conn,
+                    id=f"cx{idx}",
+                    source="codex",
+                    content=f"codex {idx}",
+                    timestamp=now + timedelta(seconds=idx),
+                )
+
+            insert_prompt(
+                conn,
+                id="cu1",
+                source="cursor",
+                content="cursor prompt",
+                timestamp=now - timedelta(days=1),
+            )
+            insert_prompt(
+                conn,
+                id="cc1",
+                source="claude_code",
+                content="claude prompt",
+                timestamp=now - timedelta(days=2),
+            )
+            insert_prompt(
+                conn,
+                id="gm1",
+                source="gemini_cli",
+                content="gemini prompt",
+                timestamp=now - timedelta(days=3),
+            )
+
+            recent = search_prompt_summaries(conn, limit=50)
+            self.assertEqual({row["source"] for row in recent}, {"codex"})
+
+            balanced = search_prompt_summaries_balanced(
+                conn,
+                sources=["claude_code", "cursor", "codex", "gemini_cli"],
+                per_source_limit=10,
+            )
+            sources = {row["source"] for row in balanced}
+            self.assertIn("codex", sources)
+            self.assertIn("cursor", sources)
+            self.assertIn("claude_code", sources)
+            self.assertIn("gemini_cli", sources)
         finally:
             conn.close()
 
