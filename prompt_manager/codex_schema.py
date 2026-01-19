@@ -24,9 +24,14 @@ class RolloutLine:
     timestamp: str
     item: "RolloutItem"
     raw: JsonDict
+    raw_line: Optional[str] = None
+    offset_start: Optional[int] = None
+    offset_end: Optional[int] = None
 
     @classmethod
-    def from_json_line(cls, line: str) -> Optional["RolloutLine"]:
+    def from_json_line(
+        cls, line: str, *, offset_start: Optional[int] = None, offset_end: Optional[int] = None
+    ) -> Optional["RolloutLine"]:
         line = line.strip()
         if not line:
             return None
@@ -36,10 +41,17 @@ class RolloutLine:
             return None
         if not isinstance(raw, dict):
             return None
-        return cls.from_dict(raw)
+        return cls.from_dict(raw, raw_line=line, offset_start=offset_start, offset_end=offset_end)
 
     @classmethod
-    def from_dict(cls, raw: JsonDict) -> Optional["RolloutLine"]:
+    def from_dict(
+        cls,
+        raw: JsonDict,
+        *,
+        raw_line: Optional[str] = None,
+        offset_start: Optional[int] = None,
+        offset_end: Optional[int] = None,
+    ) -> Optional["RolloutLine"]:
         timestamp = raw.get("timestamp")
         item_type = raw.get("type")
         payload = raw.get("payload")
@@ -48,13 +60,29 @@ class RolloutLine:
             return None
 
         item = RolloutItem.parse(item_type, payload)
-        return cls(timestamp=timestamp, item=item, raw=raw)
+        return cls(
+            timestamp=timestamp,
+            item=item,
+            raw=raw,
+            raw_line=raw_line,
+            offset_start=offset_start,
+            offset_end=offset_end,
+        )
 
 
 def iter_rollout_lines(path) -> Iterator[RolloutLine]:
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            parsed = RolloutLine.from_json_line(line)
+    with open(path, "rb") as f:
+        while True:
+            offset_start = f.tell()
+            raw_line = f.readline()
+            if not raw_line:
+                break
+            offset_end = f.tell()
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                line = raw_line.decode("utf-8", errors="replace")
+            parsed = RolloutLine.from_json_line(line, offset_start=offset_start, offset_end=offset_end)
             if parsed is not None:
                 yield parsed
 
@@ -274,4 +302,3 @@ class EventMsgItem(RolloutItem):
 class UnknownRolloutItem(RolloutItem):
     item_type: str
     raw: Any
-
