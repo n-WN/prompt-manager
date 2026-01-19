@@ -258,10 +258,16 @@ class TestCodexParser(unittest.TestCase):
             self.assertEqual(prompts[1].content, "short2")
             self.assertEqual(prompts[1].response, "reply2")
 
-            self.assertIsNotNone(prompts[0].turn_json)
-            self.assertIsNotNone(prompts[1].turn_json)
-            self.assertNotIn("short2", prompts[0].turn_json or "")
-            self.assertIn("short2", prompts[1].turn_json or "")
+            self.assertIsNotNone(prompts[0].origin_offset_start)
+            self.assertIsNotNone(prompts[0].origin_offset_end)
+            self.assertIsNotNone(prompts[1].origin_offset_start)
+            self.assertIsNotNone(prompts[1].origin_offset_end)
+
+            raw = rollout.read_bytes()
+            seg0 = raw[prompts[0].origin_offset_start : prompts[0].origin_offset_end].decode("utf-8")
+            seg1 = raw[prompts[1].origin_offset_start : prompts[1].origin_offset_end].decode("utf-8")
+            self.assertNotIn("short2", seg0)
+            self.assertIn("short2", seg1)
 
 
 class TestCursorStateVscdbParser(unittest.TestCase):

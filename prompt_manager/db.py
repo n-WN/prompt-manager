@@ -3,11 +3,18 @@
 import duckdb
 import os
 import sys
+import zlib
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
 _DEFAULT_DB_PATH = Path.home() / ".prompt-manager" / "prompts.duckdb"
+
+
+_INLINE_TEXT_BYTES = int(os.environ.get("PROMPT_MANAGER_INLINE_TEXT_BYTES", "8192"))
+_RESPONSE_PREVIEW_CHARS = int(os.environ.get("PROMPT_MANAGER_RESPONSE_PREVIEW_CHARS", "4000"))
+_COMPRESS_LEVEL = int(os.environ.get("PROMPT_MANAGER_COMPRESS_LEVEL", "1"))
+
 
 def get_default_db_path() -> Path:
     return _DEFAULT_DB_PATH
@@ -35,6 +42,64 @@ def get_recovered_db_path(db_path: Optional[Path] = None) -> Path:
 def _is_wal_replay_error(error: Exception) -> bool:
     msg = str(error)
     return "Failure while replaying WAL file" in msg
+
+
+def _wants_store_blobs() -> bool:
+    value = os.environ.get("PROMPT_MANAGER_STORE_BLOBS", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+def _decompress_text(blob: bytes) -> Optional[str]:
+    try:
+        raw = zlib.decompress(blob)
+    except Exception:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def _load_jsonl_range_as_array(path: str, start: int, end: int) -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            f.seek(int(start))
+            chunk = f.read(int(end) - int(start))
+    except Exception:
+        return None
+
+    try:
+        text = chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        text = chunk.decode("utf-8", errors="replace")
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    return "[" + ",".join(lines) + "]"
+
+
+def pack_large_text(
+    text: Optional[str],
+    *,
+    keep_preview: bool = False,
+) -> tuple[Optional[str], Optional[bytes]]:
+    """Pack a potentially large text field into (inline_text, compressed_blob)."""
+    if text is None:
+        return None, None
+
+    wants_blobs = _wants_store_blobs()
+    if not wants_blobs:
+        if not keep_preview:
+            return None, None
+        preview = text[:_RESPONSE_PREVIEW_CHARS]
+        return preview, None
+
+    raw = text.encode("utf-8")
+    if len(raw) <= _INLINE_TEXT_BYTES:
+        return text, None
+
+    inline = text[:_RESPONSE_PREVIEW_CHARS] if keep_preview else None
+    return inline, zlib.compress(raw, level=_COMPRESS_LEVEL)
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
@@ -74,9 +139,14 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             source VARCHAR NOT NULL,           -- 'claude_code', 'cursor', 'aider', 'codex', 'gemini_cli'
             project_path VARCHAR,              -- Original project path
             session_id VARCHAR,                -- Session/conversation ID
+            origin_path VARCHAR,               -- Source log file path (read-only reference)
+            origin_offset_start BIGINT,        -- Optional byte offset start within origin_path
+            origin_offset_end BIGINT,          -- Optional byte offset end within origin_path
             content TEXT NOT NULL,             -- The actual prompt text
             response TEXT,                     -- LLM response text
+            response_blob BLOB,                -- Optional compressed response
             turn_json TEXT,                    -- Per-turn raw timeline (JSON)
+            turn_json_blob BLOB,               -- Optional compressed turn JSON
             timestamp TIMESTAMP,               -- When the prompt was created
             tags VARCHAR[],                    -- User-defined tags
             starred BOOLEAN DEFAULT FALSE,     -- User favorites
@@ -97,6 +167,31 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute("ALTER TABLE prompts ADD COLUMN turn_json TEXT")
     except Exception:
         pass  # Column already exists
+
+    try:
+        conn.execute("ALTER TABLE prompts ADD COLUMN response_blob BLOB")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE prompts ADD COLUMN turn_json_blob BLOB")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE prompts ADD COLUMN origin_path VARCHAR")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE prompts ADD COLUMN origin_offset_start BIGINT")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE prompts ADD COLUMN origin_offset_end BIGINT")
+    except Exception:
+        pass
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sync_state (
@@ -134,6 +229,9 @@ def insert_prompt(
     content: str,
     project_path: Optional[str] = None,
     session_id: Optional[str] = None,
+    origin_path: Optional[str] = None,
+    origin_offset_start: Optional[int] = None,
+    origin_offset_end: Optional[int] = None,
     timestamp: Optional[datetime] = None,
     response: Optional[str] = None,
     turn_json: Optional[str] = None,
@@ -144,14 +242,36 @@ def insert_prompt(
     Returns:
         True if a new row was inserted, False if it already existed.
     """
+    inline_response, response_blob = pack_large_text(response, keep_preview=True)
+    inline_turn_json, turn_blob = pack_large_text(turn_json, keep_preview=False)
     inserted = conn.execute(
         """
-        INSERT INTO prompts (id, source, project_path, session_id, content, timestamp, response, turn_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO prompts (
+            id, source, project_path, session_id, origin_path,
+            origin_offset_start, origin_offset_end,
+            content, timestamp,
+            response, response_blob,
+            turn_json, turn_json_blob
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (id) DO NOTHING
         RETURNING id
         """,
-        [id, source, project_path, session_id, content, timestamp, response, turn_json],
+        [
+            id,
+            source,
+            project_path,
+            session_id,
+            origin_path,
+            origin_offset_start,
+            origin_offset_end,
+            content,
+            timestamp,
+            inline_response,
+            response_blob,
+            inline_turn_json,
+            turn_blob,
+        ],
     ).fetchone()
 
     if inserted:
@@ -159,27 +279,51 @@ def insert_prompt(
 
     # Existing prompt: opportunistically fill in missing fields without
     # counting it as a "new prompt" for sync stats.
-    if backfill_missing_fields and (response or turn_json):
-        # NOTE: Updating large TEXT columns can be expensive in DuckDB even when
-        # the values don't change. Only backfill when the stored value is NULL.
+    if backfill_missing_fields and (response or turn_json or origin_path):
         needs_backfill = conn.execute(
-            "SELECT response IS NULL, turn_json IS NULL FROM prompts WHERE id = ?",
+            """
+            SELECT
+                (response IS NULL AND response_blob IS NULL) AS response_missing,
+                (turn_json IS NULL AND turn_json_blob IS NULL) AS turn_missing,
+                origin_path IS NULL AS origin_missing,
+                origin_offset_start IS NULL AS offset_start_missing,
+                origin_offset_end IS NULL AS offset_end_missing
+            FROM prompts
+            WHERE id = ?
+            """,
             [id],
         ).fetchone()
 
-        needs_response = bool(needs_backfill and needs_backfill[0] and response is not None)
-        needs_turn_json = bool(needs_backfill and needs_backfill[1] and turn_json is not None)
+        needs_response = bool(needs_backfill and needs_backfill[0] and (inline_response or response_blob))
+        needs_turn_json = bool(needs_backfill and needs_backfill[1] and (inline_turn_json or turn_blob))
+        needs_origin = bool(needs_backfill and needs_backfill[2] and origin_path)
+        needs_offset_start = bool(needs_backfill and needs_backfill[3] and origin_offset_start is not None)
+        needs_offset_end = bool(needs_backfill and needs_backfill[4] and origin_offset_end is not None)
 
-        if needs_response or needs_turn_json:
+        if needs_response or needs_turn_json or needs_origin or needs_offset_start or needs_offset_end:
             conn.execute(
                 """
                 UPDATE prompts
                 SET response = COALESCE(response, ?),
+                    response_blob = COALESCE(response_blob, ?),
                     turn_json = COALESCE(turn_json, ?),
+                    turn_json_blob = COALESCE(turn_json_blob, ?),
+                    origin_path = COALESCE(origin_path, ?),
+                    origin_offset_start = COALESCE(origin_offset_start, ?),
+                    origin_offset_end = COALESCE(origin_offset_end, ?),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                [response, turn_json, id],
+                [
+                    inline_response,
+                    response_blob,
+                    inline_turn_json,
+                    turn_blob,
+                    origin_path,
+                    origin_offset_start,
+                    origin_offset_end,
+                    id,
+                ],
             )
 
     return False
@@ -288,6 +432,8 @@ def get_prompt(conn: duckdb.DuckDBPyConnection, prompt_id: str) -> Optional[dict
         """
         SELECT id, source, project_path, session_id, content, timestamp,
                tags, starred, use_count, created_at, response, turn_json
+             , response_blob, turn_json_blob, origin_path
+             , origin_offset_start, origin_offset_end
         FROM prompts
         WHERE id = ?
         """,
@@ -310,6 +456,70 @@ def get_prompt(conn: duckdb.DuckDBPyConnection, prompt_id: str) -> Optional[dict
         "created_at",
         "response",
         "turn_json",
+        "response_blob",
+        "turn_json_blob",
+        "origin_path",
+        "origin_offset_start",
+        "origin_offset_end",
+    ]
+    row = dict(zip(columns, result))
+
+    if row.get("response_blob") is not None:
+        restored = _decompress_text(row["response_blob"])
+        if restored is not None:
+            row["response"] = restored
+
+    if row.get("turn_json_blob") is not None:
+        restored = _decompress_text(row["turn_json_blob"])
+        if restored is not None:
+            row["turn_json"] = restored
+
+    if (
+        row.get("turn_json") is None
+        and row.get("source") == "codex"
+        and row.get("origin_path")
+        and row.get("origin_offset_start") is not None
+        and row.get("origin_offset_end") is not None
+    ):
+        restored = _load_jsonl_range_as_array(
+            str(row["origin_path"]),
+            int(row["origin_offset_start"]),
+            int(row["origin_offset_end"]),
+        )
+        if restored is not None:
+            row["turn_json"] = restored
+
+    row.pop("response_blob", None)
+    row.pop("turn_json_blob", None)
+    return row
+
+
+def get_prompt_preview(conn: duckdb.DuckDBPyConnection, prompt_id: str) -> Optional[dict]:
+    """Get prompt fields needed for list/preview views (does not hydrate turn_json)."""
+    result = conn.execute(
+        """
+        SELECT id, source, project_path, session_id, content, timestamp,
+               tags, starred, use_count, created_at, response
+        FROM prompts
+        WHERE id = ?
+        """,
+        [prompt_id],
+    ).fetchone()
+    if not result:
+        return None
+
+    columns = [
+        "id",
+        "source",
+        "project_path",
+        "session_id",
+        "content",
+        "timestamp",
+        "tags",
+        "starred",
+        "use_count",
+        "created_at",
+        "response",
     ]
     return dict(zip(columns, result))
 

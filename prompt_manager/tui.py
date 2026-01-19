@@ -27,6 +27,7 @@ import threading
 from .db import (
     get_connection,
     get_prompt,
+    get_prompt_preview,
     get_stats,
     increment_use_count,
     search_prompt_summaries,
@@ -322,8 +323,6 @@ class PromptDetailScreen(ModalScreen):
         self.prompt = prompt
 
     def compose(self) -> ComposeResult:
-        content = self.prompt.get("content", "")
-        response = self.prompt.get("response") or ""
         source = self.prompt.get("source", "unknown")
         project = self.prompt.get("project_path", "N/A")
         timestamp = self.prompt.get("timestamp")
@@ -331,6 +330,8 @@ class PromptDetailScreen(ModalScreen):
         session = self.prompt.get("session_id", "N/A")
         prompt_id = self.prompt.get("id")
 
+        content = self.prompt.get("content", "")
+        response = self.prompt.get("response") or ""
         turn_json = None
         if prompt_id:
             conn = getattr(self.app, "conn", None)
@@ -341,6 +342,8 @@ class PromptDetailScreen(ModalScreen):
             try:
                 full_prompt = get_prompt(conn, prompt_id)
                 if full_prompt:
+                    content = full_prompt.get("content") or content
+                    response = full_prompt.get("response") or response
                     turn_json = full_prompt.get("turn_json")
             except Exception:
                 turn_json = None
@@ -1154,9 +1157,9 @@ class PromptManagerApp(App):
         prompt_id = node.data
         cached = self.prompt_map[prompt_id]
 
-        # Summaries intentionally omit `response`. Load full prompt lazily on select.
+        # Summaries intentionally omit `response`. Load a lightweight preview row on select.
         if "response" not in cached:
-            full = get_prompt(self.conn, prompt_id)
+            full = get_prompt_preview(self.conn, prompt_id)
             if full:
                 self.prompt_map[prompt_id] = full
                 cached = full

@@ -56,6 +56,13 @@ def main():
 
     # Database info / diagnostics
     db_info_parser = subparsers.add_parser("db-info", help="Show database file sizes and status")
+    db_analyze_parser = subparsers.add_parser("db-analyze", help="Analyze column storage sizes in the DB")
+    db_clean_parser = subparsers.add_parser("db-clean", help="Clean old DB/WAL files in ~/.prompt-manager")
+    db_clean_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete files (default: dry-run)",
+    )
 
     # Codex transcript (from rollout jsonl)
     codex_transcript_parser = subparsers.add_parser(
@@ -246,6 +253,207 @@ def main():
                         conn.close()
                     except Exception:
                         pass
+
+    elif args.command == "db-analyze":
+        import os
+        import duckdb
+
+        from .db import get_db_path
+
+        db_path = get_db_path()
+        if not os.path.exists(str(db_path)):
+            print(f"DB not found: {db_path}")
+            return
+
+        try:
+            conn = duckdb.connect(str(db_path), read_only=True)
+        except Exception as e:
+            print(f"Failed to open DB read-only: {e}")
+            return
+
+        try:
+            counts = conn.execute(
+                "SELECT source, COUNT(*) AS n FROM prompts GROUP BY source ORDER BY n DESC"
+            ).fetchall()
+            print("Rows per source")
+            for source, n in counts:
+                print(f"  {source:12} {n}")
+
+            sizes = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS n,
+                    SUM(length(content)) AS content_chars,
+                    SUM(length(response)) AS response_chars,
+                    SUM(length(turn_json)) AS turn_chars,
+                    SUM(octet_length(response_blob)) AS response_blob_bytes,
+                    SUM(octet_length(turn_json_blob)) AS turn_blob_bytes
+                FROM prompts
+                """
+            ).fetchone()
+
+            def fmt_bytes(n: int) -> str:
+                units = ["B", "KiB", "MiB", "GiB", "TiB"]
+                v = float(n)
+                for u in units:
+                    if v < 1024.0 or u == units[-1]:
+                        if u == "B":
+                            return f"{int(v)} {u}"
+                        return f"{v:.1f} {u}"
+                    v /= 1024.0
+                return f"{n} B"
+
+            n_rows, content_chars, response_chars, turn_chars, resp_blob, turn_blob = sizes
+            print("")
+            print("Estimated stored payload")
+            print(f"  rows:                 {n_rows}")
+            print(f"  content (chars):      {content_chars or 0:,}")
+            print(f"  response (chars):     {response_chars or 0:,}")
+            print(f"  turn_json (chars):    {turn_chars or 0:,}")
+            print(f"  response_blob (bytes): {fmt_bytes(int(resp_blob or 0))}")
+            print(f"  turn_json_blob (bytes): {fmt_bytes(int(turn_blob or 0))}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    elif args.command == "db-clean":
+        import os
+        import duckdb
+        import shutil
+
+        from .db import get_db_path, get_default_db_path, get_recovered_db_path
+
+        active_path = get_db_path()
+        default_path = get_default_db_path()
+        recovered_path = get_recovered_db_path(default_path)
+        root = default_path.parent
+
+        def fmt_bytes(n: int) -> str:
+            units = ["B", "KiB", "MiB", "GiB", "TiB"]
+            v = float(n)
+            for u in units:
+                if v < 1024.0 or u == units[-1]:
+                    if u == "B":
+                        return f"{int(v)} {u}"
+                    return f"{v:.1f} {u}"
+                v /= 1024.0
+            return f"{n} B"
+
+        def file_size(path: Path) -> int:
+            try:
+                return path.stat().st_size
+            except OSError:
+                return 0
+
+        def safe_unlink(path: Path) -> bool:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                return False
+            if root not in resolved.parents and resolved != root:
+                return False
+            try:
+                path.unlink()
+                return True
+            except OSError:
+                return False
+
+        print("Prompt Manager DB Clean")
+        print("=" * 40)
+        print(f"DB dir:   {root}")
+        print(f"Active DB:{active_path}")
+        print("")
+
+        if not root.exists():
+            print("Nothing to clean.")
+            return
+
+        entries = []
+        for p in sorted(root.glob("*")):
+            if p.is_dir():
+                continue
+            entries.append((p, file_size(p)))
+
+        if not entries:
+            print("Nothing to clean.")
+            return
+
+        print("Files")
+        for p, sz in entries:
+            tag = ""
+            if p == active_path or str(p) == f"{active_path}.wal":
+                tag = " (active)"
+            elif p == default_path or str(p) == f"{default_path}.wal":
+                tag = " (default)"
+            elif p == recovered_path or str(p) == f"{recovered_path}.wal":
+                tag = " (recovered)"
+            print(f"  {p.name:32} {fmt_bytes(sz):>10}{tag}")
+
+        default_broken = False
+        if default_path.exists():
+            try:
+                conn = duckdb.connect(str(default_path), read_only=True)
+            except Exception as e:
+                if "Failure while replaying WAL file" in str(e):
+                    default_broken = True
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        # Recommend deleting broken default WAL/DB when recovered is present.
+        candidates: list[Path] = []
+        default_wal = default_path.with_suffix(default_path.suffix + ".wal")
+        if recovered_path.exists():
+            if default_wal.exists() and (active_path != default_path or default_broken):
+                candidates.append(default_wal)
+            if default_path.exists() and (active_path != default_path or default_broken):
+                candidates.append(default_path)
+
+        orphans = [p for p, _ in entries if p.suffix == ".wal" and not Path(str(p)[:-4]).exists()]
+        candidates.extend(orphans)
+
+        # De-dup, skip active.
+        unique = []
+        seen = set()
+        active_wal = Path(str(active_path) + ".wal")
+        for p in candidates:
+            if p in {active_path, active_wal}:
+                continue
+            if p in seen:
+                continue
+            seen.add(p)
+            unique.append(p)
+
+        print("")
+        if not unique:
+            print("No cleanup candidates detected.")
+            return
+
+        print("Cleanup candidates")
+        for p in unique:
+            print(f"  {p}  ({fmt_bytes(file_size(p))})")
+
+        if not args.yes:
+            print("")
+            print("Dry-run only. Re-run with `pm db-clean --yes` to delete these files.")
+            return
+
+        print("")
+        ok = 0
+        for p in unique:
+            if safe_unlink(p):
+                ok += 1
+        print(f"Deleted {ok}/{len(unique)} files.")
+        if shutil.which("ls"):
+            print("")
+            print(f"Remaining in {root}:")
+            for p, _ in entries:
+                if p.exists():
+                    print(f"  {p.name}")
 
     elif args.command == "codex-transcript":
         from .codex_transcript import format_codex_rollout_transcript

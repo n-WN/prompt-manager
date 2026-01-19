@@ -9,7 +9,7 @@ import logging
 import time
 from typing import Callable, Optional, TYPE_CHECKING
 
-from .db import get_connection, insert_prompt
+from .db import get_connection, insert_prompt, pack_large_text
 from .parsers.claude_code import ClaudeCodeParser
 from .parsers.cursor import CursorParser
 from .parsers.aider import AiderParser
@@ -146,7 +146,18 @@ def _sync_file(
     count = 0
     items_done = 0
     last_emit = 0.0
-    backfill_rows: list[tuple[str, Optional[str], Optional[str]]] = []
+    backfill_rows: list[
+        tuple[
+            str,
+            Optional[str],
+            Optional[bytes],
+            Optional[str],
+            Optional[bytes],
+            Optional[str],
+            Optional[int],
+            Optional[int],
+        ]
+    ] = []
     backfill_batch_size = 250
 
     try:
@@ -168,17 +179,30 @@ def _sync_file(
         if not backfill_rows:
             return
         conn.execute("DROP TABLE IF EXISTS tmp_backfill")
-        conn.execute("CREATE TEMP TABLE tmp_backfill(id VARCHAR, response TEXT, turn_json TEXT)")
-        conn.executemany("INSERT INTO tmp_backfill VALUES (?,?,?)", backfill_rows)
+        conn.execute(
+            "CREATE TEMP TABLE tmp_backfill(id VARCHAR, response TEXT, response_blob BLOB, turn_json TEXT, turn_json_blob BLOB, origin_path VARCHAR, origin_offset_start BIGINT, origin_offset_end BIGINT)"
+        )
+        conn.executemany("INSERT INTO tmp_backfill VALUES (?,?,?,?,?,?,?,?)", backfill_rows)
         conn.execute(
             """
             UPDATE prompts
             SET response = COALESCE(prompts.response, tmp_backfill.response),
+                response_blob = COALESCE(prompts.response_blob, tmp_backfill.response_blob),
                 turn_json = COALESCE(prompts.turn_json, tmp_backfill.turn_json),
+                turn_json_blob = COALESCE(prompts.turn_json_blob, tmp_backfill.turn_json_blob),
+                origin_path = COALESCE(prompts.origin_path, tmp_backfill.origin_path),
+                origin_offset_start = COALESCE(prompts.origin_offset_start, tmp_backfill.origin_offset_start),
+                origin_offset_end = COALESCE(prompts.origin_offset_end, tmp_backfill.origin_offset_end),
                 updated_at = CURRENT_TIMESTAMP
             FROM tmp_backfill
             WHERE prompts.id = tmp_backfill.id
-              AND (prompts.response IS NULL OR prompts.turn_json IS NULL)
+              AND (
+                (prompts.response IS NULL AND prompts.response_blob IS NULL)
+                OR (prompts.turn_json IS NULL AND prompts.turn_json_blob IS NULL)
+                OR prompts.origin_path IS NULL
+                OR prompts.origin_offset_start IS NULL
+                OR prompts.origin_offset_end IS NULL
+              )
             """
         )
         conn.execute("DROP TABLE tmp_backfill")
@@ -207,6 +231,9 @@ def _sync_file(
                 content=prompt.content,
                 project_path=prompt.project_path,
                 session_id=prompt.session_id,
+                origin_path=str(file_path),
+                origin_offset_start=prompt.origin_offset_start,
+                origin_offset_end=prompt.origin_offset_end,
                 timestamp=prompt.timestamp,
                 response=prompt.response,
                 turn_json=prompt.turn_json,
@@ -218,13 +245,38 @@ def _sync_file(
                 # Backfill missing large fields in a single set-based UPDATE (fast),
                 # instead of per-prompt UPDATEs (can be very slow in DuckDB).
                 needs_backfill = conn.execute(
-                    "SELECT response IS NULL, turn_json IS NULL FROM prompts WHERE id = ?",
+                    """
+                    SELECT
+                        (response IS NULL AND response_blob IS NULL) AS response_missing,
+                        (turn_json IS NULL AND turn_json_blob IS NULL) AS turn_missing,
+                        origin_path IS NULL AS origin_missing,
+                        origin_offset_start IS NULL AS offset_start_missing,
+                        origin_offset_end IS NULL AS offset_end_missing
+                    FROM prompts
+                    WHERE id = ?
+                    """,
                     [prompt.id],
                 ).fetchone()
-                needs_response = bool(needs_backfill and needs_backfill[0] and prompt.response is not None)
-                needs_turn_json = bool(needs_backfill and needs_backfill[1] and prompt.turn_json is not None)
-                if needs_response or needs_turn_json:
-                    backfill_rows.append((prompt.id, prompt.response, prompt.turn_json))
+                inline_response, response_blob = pack_large_text(prompt.response, keep_preview=True)
+                inline_turn_json, turn_blob = pack_large_text(prompt.turn_json, keep_preview=False)
+                needs_response = bool(needs_backfill and needs_backfill[0] and (inline_response or response_blob))
+                needs_turn_json = bool(needs_backfill and needs_backfill[1] and (inline_turn_json or turn_blob))
+                needs_origin = bool(needs_backfill and needs_backfill[2])
+                needs_offset_start = bool(needs_backfill and needs_backfill[3] and prompt.origin_offset_start is not None)
+                needs_offset_end = bool(needs_backfill and needs_backfill[4] and prompt.origin_offset_end is not None)
+                if needs_response or needs_turn_json or needs_origin or needs_offset_start or needs_offset_end:
+                    backfill_rows.append(
+                        (
+                            prompt.id,
+                            inline_response,
+                            response_blob,
+                            inline_turn_json,
+                            turn_blob,
+                            str(file_path),
+                            prompt.origin_offset_start,
+                            prompt.origin_offset_end,
+                        )
+                    )
 
             if len(backfill_rows) >= backfill_batch_size:
                 flush_backfill_rows()

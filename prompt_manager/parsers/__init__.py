@@ -20,6 +20,8 @@ class ParsedPrompt:
     timestamp: Optional[datetime] = None
     response: Optional[str] = None
     turn_json: Optional[str] = None
+    origin_offset_start: Optional[int] = None
+    origin_offset_end: Optional[int] = None
 
 
 class BaseParser(ABC):
