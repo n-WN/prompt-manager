@@ -215,6 +215,11 @@ class TestCodexParser(unittest.TestCase):
                     },
                 },
                 {
+                    "timestamp": "2026-01-19T01:45:39.500Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "reply1"},
+                },
+                {
                     "timestamp": "2026-01-19T01:45:40.000Z",
                     "type": "response_item",
                     "payload": {
@@ -247,6 +252,15 @@ class TestCodexParser(unittest.TestCase):
                     "timestamp": "2026-01-19T01:45:56.000Z",
                     "type": "event_msg",
                     "payload": {"type": "agent_message", "message": "reply2"},
+                },
+                {
+                    "timestamp": "2026-01-19T01:45:56.100Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "reply2"}],
+                    },
                 },
             ]
             rollout.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
