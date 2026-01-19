@@ -134,7 +134,7 @@ class SyncProgressScreen(ModalScreen):
             yield Label(self._title, id="sync-title")
             yield Rule()
             yield Static("", id="sync-status")
-            yield ProgressBar(total=1, progress=0, id="sync-progress")
+            yield ProgressBar(total=1, id="sync-progress")
 
     def update_progress(self, progress: SyncProgress) -> None:
         total = max(progress.files_total, 1)
