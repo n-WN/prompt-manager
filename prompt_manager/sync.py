@@ -138,11 +138,11 @@ def _sync_file(
     file_path: Path,
     *,
     progress: Optional[Callable[[int, int], None]] = None,
-) -> int:
-    """Sync a single file and return number of prompts inserted.
+) -> tuple[int, Optional[str]]:
+    """Sync a single file and return (prompts_inserted, error_message).
 
     Returns:
-        Number of new prompts inserted, or -1 on error
+        (number of new prompts inserted, None) on success, or (-1, message) on error.
     """
     count = 0
     items_done = 0
@@ -315,16 +315,19 @@ def _sync_file(
                 logging.exception("CHECKPOINT failed after syncing %s", file_path)
         if progress:
             progress(items_done, count)
-        return count
+        return count, None
 
     except Exception as e:
         try:
             conn.execute("ROLLBACK")
         except Exception:
             pass
+        msg = f"{type(e).__name__}: {e}".strip()
+        if len(msg) > 220:
+            msg = msg[:217] + "..."
         # Log error but don't crash - return -1 to indicate failure
-        print(f"Error syncing {file_path}: {e}")
-        return -1
+        print(f"Error syncing {file_path}: {msg}")
+        return -1, msg
 
 
 def sync_all(
@@ -478,12 +481,13 @@ def sync_all(
                 )
 
             result = _sync_file(conn, parser, file_path, progress=emit_file_progress)
-            if result >= 0:
-                inserted_in_file = result
-                counts[parser.source_name] = counts.get(parser.source_name, 0) + result
-                counts["total"] += result
+            inserted_count, sync_error = result
+            if inserted_count >= 0:
+                inserted_in_file = inserted_count
+                counts[parser.source_name] = counts.get(parser.source_name, 0) + inserted_count
+                counts["total"] += inserted_count
             else:
-                error = "sync failed"
+                error = sync_error or "sync failed"
                 counts["files_failed"] += 1
         else:
             counts["files_skipped"] += 1
@@ -651,9 +655,9 @@ def sync_source(source: str, conn: Optional[duckdb.DuckDBPyConnection] = None, f
         if not force and not _file_needs_sync(conn, parser, file_path):
             continue
 
-        result = _sync_file(conn, parser, file_path)
-        if result >= 0:
-            count += result
+        inserted_count, _ = _sync_file(conn, parser, file_path)
+        if inserted_count >= 0:
+            count += inserted_count
 
     return count
 
