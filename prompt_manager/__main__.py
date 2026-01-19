@@ -360,15 +360,32 @@ def main():
             except OSError:
                 return False
 
-        print("Prompt Manager DB Clean")
-        print("=" * 40)
-        print(f"DB dir:   {root}")
-        print(f"Active DB:{active_path}")
-        print("")
-
         if not root.exists():
             print("Nothing to clean.")
             return
+
+        default_broken = False
+        if default_path.exists():
+            try:
+                conn = duckdb.connect(str(default_path), read_only=True)
+            except Exception as e:
+                if "Failure while replaying WAL file" in str(e):
+                    default_broken = True
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        effective_active = active_path
+        if os.environ.get("PROMPT_MANAGER_DB_PATH") is None and default_broken and recovered_path.exists():
+            effective_active = recovered_path
+
+        print("Prompt Manager DB Clean")
+        print("=" * 40)
+        print(f"DB dir:   {root}")
+        print(f"Active DB:{effective_active}")
+        print("")
 
         entries = []
         for p in sorted(root.glob("*")):
@@ -383,26 +400,13 @@ def main():
         print("Files")
         for p, sz in entries:
             tag = ""
-            if p == active_path or str(p) == f"{active_path}.wal":
+            if p == effective_active or str(p) == f"{effective_active}.wal":
                 tag = " (active)"
             elif p == default_path or str(p) == f"{default_path}.wal":
                 tag = " (default)"
             elif p == recovered_path or str(p) == f"{recovered_path}.wal":
                 tag = " (recovered)"
             print(f"  {p.name:32} {fmt_bytes(sz):>10}{tag}")
-
-        default_broken = False
-        if default_path.exists():
-            try:
-                conn = duckdb.connect(str(default_path), read_only=True)
-            except Exception as e:
-                if "Failure while replaying WAL file" in str(e):
-                    default_broken = True
-            else:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
 
         # Recommend deleting broken default WAL/DB when recovered is present.
         candidates: list[Path] = []
@@ -419,9 +423,9 @@ def main():
         # De-dup, skip active.
         unique = []
         seen = set()
-        active_wal = Path(str(active_path) + ".wal")
+        active_wal = Path(str(effective_active) + ".wal")
         for p in candidates:
-            if p in {active_path, active_wal}:
+            if p in {effective_active, active_wal}:
                 continue
             if p in seen:
                 continue
