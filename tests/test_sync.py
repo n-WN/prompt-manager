@@ -79,3 +79,27 @@ class TestSyncVersion(unittest.TestCase):
             self.assertIn("sync_version", columns)
         finally:
             conn.close()
+
+    def test_force_does_not_sync_missing_files(self) -> None:
+        class MissingParser(BaseParser):
+            source_name = "missing"
+
+            def __init__(self, path: Path):
+                self._path = path
+
+            def find_log_files(self):
+                yield self._path
+
+            def parse_file(self, _file_path: Path):
+                # Should never be called when the file doesn't exist.
+                raise AssertionError("parse_file should not be called for missing files")
+
+        conn = duckdb.connect(":memory:")
+        try:
+            _init_schema(conn)
+            missing = Path("/tmp/pm-missing-file-does-not-exist-12345.log")
+            counts = sync_all(conn, force=True, parsers=[MissingParser(missing)])
+            self.assertEqual(int(counts.get("files_failed") or 0), 0)
+            self.assertEqual(int(counts.get("files_skipped") or 0), 1)
+        finally:
+            conn.close()
