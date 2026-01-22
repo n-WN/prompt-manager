@@ -88,7 +88,7 @@ class CursorParser(BaseParser):
         chat_id = file_path.parent.name
 
         try:
-            conn = sqlite3.connect(f"file:{file_path}?mode=ro", uri=True)
+            conn = sqlite3.connect(f"file:{file_path}?mode=ro", uri=True, timeout=15.0)
         except sqlite3.Error:
             return
 
@@ -228,7 +228,9 @@ class CursorParser(BaseParser):
     def _parse_state_vscdb(self, file_path: Path) -> Iterator[ParsedPrompt]:
         """Parse Cursor globalStorage DB (state.vscdb)."""
         try:
-            conn = sqlite3.connect(f"file:{file_path}?mode=ro", uri=True)
+            # Cursor writes to this DB frequently; allow a longer busy timeout so rebuild doesn't
+            # fail when the editor briefly holds a write lock.
+            conn = sqlite3.connect(f"file:{file_path}?mode=ro", uri=True, timeout=60.0)
         except sqlite3.Error:
             return
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import logging
 import time
+import errno
 from typing import Callable, Optional, TYPE_CHECKING
 
 from .db import get_connection, insert_prompt, pack_large_text
@@ -109,8 +110,10 @@ def _file_sync_status(
         stat = file_path.stat()
         current_size = stat.st_size
         current_mtime = stat.st_mtime
-    except OSError:
-        return False, "missing"
+    except OSError as e:
+        if getattr(e, "errno", None) == errno.ENOENT:
+            return False, "missing"
+        return False, "unreadable"
 
     state = _get_file_state(conn, str(file_path))
     if state is None:
@@ -403,7 +406,7 @@ def sync_all(
         counts["files_checked"] = idx
 
         needs_sync, reason = _file_sync_status(conn, parser, file_path)
-        if force:
+        if force and reason not in {"missing", "unreadable"} and not needs_sync:
             needs_sync, reason = True, "forced"
 
         if progress_callback:
